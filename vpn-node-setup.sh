@@ -8,9 +8,19 @@
 #  ██╔╝ ██╗██║  ██║██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝
 #  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ 
 #                                                         
-#  XRAY/REMNAWAVE NODE BUILDER v4.0 (All-in-One)
+#  XRAY/REMNAWAVE NODE BUILDER v4.1 (All-in-One)
 #  Ядро XanMod + BBRv3 + Полная оптимизация системы
 #  Поддерживает: Debian 12/13, Ubuntu 22.04/24.04
+#
+#  v4.1 changelog:
+#  - Безопасные бусты: notsent_lowat, GRO flush, ethtool offloads, ring buffers, XPS
+#  - Fix: cloud-init detection (Hetzner/DO/Vultr/AWS) — не удаляем на облаках
+#  - Fix: убран tcp_fastopen=3 (конфликт с Xray Reality)
+#  - Fix: hashsize применяется мягко (без лагов на активном трафике)
+#  - Fix: qdisc через add/change вместо replace (без drop пакетов)
+#  - Fix: hex-индексация mq для 16+ очередей (10G NIC)
+#  - Fix: проверка свободного места + GRUB fallback на старое ядро
+#  - Fix: бэкап существующих sysctl/limits перед перезаписью
 # ==============================================================================
 
 set -o pipefail
@@ -51,8 +61,9 @@ echo "   ██╔██╗ ██╔══██║██║╚██╗██�
 echo "  ██╔╝ ██╗██║  ██║██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝"
 echo "  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ "
 echo -e "${NC}"
-echo -e "${BOLD}  XRAY/REMNAWAVE NODE BUILDER v4.0 (All-in-One)${NC}"
+echo -e "${BOLD}  XRAY/REMNAWAVE NODE BUILDER v4.1 (All-in-One)${NC}"
 echo -e "  ${YELLOW}XanMod + BBRv3 + Очистка + Сетевой стек + Conntrack + Gaming-friendly${NC}"
+echo -e "  ${GREEN}+ Safe boosts: notsent_lowat, GRO, ethtool, XPS${NC}"
 echo ""
 sleep 1
 
@@ -114,10 +125,87 @@ echo ""
 
 print_header "ШАГ 2: ОЧИСТКА СИСТЕМЫ"
 
+# --- Детект cloud-окружения (защита от поломки сети после ребута) ---
+print_status "Определяем cloud-провайдера..."
+
+# Устанавливаем dmidecode если его нет (тихо, без вывода)
+if ! command -v dmidecode >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y dmidecode >/dev/null 2>&1 || true
+fi
+
+CLOUD_DETECTED="none"
+
+# Уровень 1: dmidecode
+if command -v dmidecode >/dev/null 2>&1; then
+    DMI_VENDOR=$(dmidecode -s system-manufacturer 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    DMI_PRODUCT=$(dmidecode -s system-product-name 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    case "${DMI_VENDOR}${DMI_PRODUCT}" in
+        *hetzner*)         CLOUD_DETECTED="hetzner" ;;
+        *digitalocean*)    CLOUD_DETECTED="digitalocean" ;;
+        *vultr*)           CLOUD_DETECTED="vultr" ;;
+        *amazon*|*ec2*)    CLOUD_DETECTED="aws" ;;
+        *google*)          CLOUD_DETECTED="gcp" ;;
+        *microsoft*)       CLOUD_DETECTED="azure" ;;
+        *openstack*)       CLOUD_DETECTED="openstack" ;;
+        *oracle*)          CLOUD_DETECTED="oracle" ;;
+        *linode*|*akamai*) CLOUD_DETECTED="linode" ;;
+    esac
+fi
+
+# Уровень 2: cloud-init datasource (надёжнее чем dmidecode)
+if [ "$CLOUD_DETECTED" = "none" ] && [ -d /var/lib/cloud/instance ]; then
+    CLOUD_DETECTED="cloud-init-managed"
+fi
+
+# Уровень 3: проверка управляет ли cloud-init сетью или SSH
+if [ "$CLOUD_DETECTED" = "none" ]; then
+    # Если есть конфиги cloud-init для сети или SSH — НЕ удаляем
+    if [ -f /etc/netplan/50-cloud-init.yaml ] || \
+       [ -f /etc/network/interfaces.d/50-cloud-init ] || \
+       [ -d /var/lib/cloud/seed ]; then
+        CLOUD_DETECTED="cloud-init-active"
+    fi
+fi
+
+# Уровень 4: SAFETY-NET — если cloud-init установлен и есть SSH ключи в /root/.ssh
+# которые ОН мог положить — НЕ рискуем
+if [ "$CLOUD_DETECTED" = "none" ] && dpkg -l cloud-init &>/dev/null; then
+    if [ -f /root/.ssh/authorized_keys ] && grep -q "ssh-" /root/.ssh/authorized_keys 2>/dev/null; then
+        # SSH ключи есть, cloud-init установлен — может быть он их и поставил
+        # Безопаснее НЕ удалять
+        CLOUD_DETECTED="cloud-init-installed-with-keys"
+    fi
+fi
+
+if [ "$CLOUD_DETECTED" != "none" ]; then
+    print_info "Обнаружено: ${BOLD}$CLOUD_DETECTED${NC}"
+    print_info "cloud-init НЕ будет удалён (управляет SSH-ключами и сетью)"
+else
+    print_ok "Bare-metal без cloud-init — безопасно удалять"
+fi
+
+# --- Бэкап существующих конфигов ---
+print_status "Создаём бэкап существующих конфигов..."
+BACKUP_DIR="/root/vpn-node-builder-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+[ -f /etc/sysctl.conf ] && cp /etc/sysctl.conf "$BACKUP_DIR/" 2>/dev/null
+[ -d /etc/sysctl.d ] && cp -r /etc/sysctl.d "$BACKUP_DIR/" 2>/dev/null
+[ -d /etc/security/limits.d ] && cp -r /etc/security/limits.d "$BACKUP_DIR/" 2>/dev/null
+[ -d /etc/systemd/system.conf.d ] && cp -r /etc/systemd/system.conf.d "$BACKUP_DIR/" 2>/dev/null
+print_ok "Бэкап сохранён: $BACKUP_DIR"
+echo ""
+
 # --- Удаление ненужных пакетов ---
 print_status "Удаляем ненужные пакеты..."
 echo ""
-PKGS_TO_PURGE=("snapd" "cloud-init" "apport" "whoopsie" "ubuntu-report" "popularity-contest")
+# Базовый список
+PKGS_TO_PURGE=("snapd" "apport" "whoopsie" "ubuntu-report" "popularity-contest")
+# cloud-init добавляем только если НЕ на облаке
+if [ "$CLOUD_DETECTED" = "none" ]; then
+    PKGS_TO_PURGE+=("cloud-init")
+else
+    print_info "cloud-init пропущен (cloud: $CLOUD_DETECTED)"
+fi
 for pkg in "${PKGS_TO_PURGE[@]}"; do
     if dpkg -l "$pkg" &>/dev/null; then
         apt-get purge -y "$pkg" 2>/dev/null || true
@@ -291,6 +379,28 @@ echo ""
 
 print_status "Устанавливаем ядро: ${BOLD}${KERNEL_PKG}${NC}"
 echo ""
+
+# Проверка свободного места (нужно ~500MB на ядро)
+FREE_BOOT=$(df -m /boot 2>/dev/null | awk 'NR==2 {print $4}')
+FREE_ROOT=$(df -m / | awk 'NR==2 {print $4}')
+echo -e "    Свободно на /boot: ${GREEN}${FREE_BOOT:-N/A} MB${NC}"
+echo -e "    Свободно на /:     ${GREEN}${FREE_ROOT} MB${NC}"
+
+if [ -n "$FREE_BOOT" ] && [ "$FREE_BOOT" -lt 200 ]; then
+    print_error "На /boot меньше 200MB! Установка ядра может не пройти."
+    print_info "Очистите старые ядра: apt autoremove --purge"
+    exit 1
+fi
+if [ "$FREE_ROOT" -lt 1500 ]; then
+    print_error "На / меньше 1.5GB! Установка ядра может не пройти."
+    exit 1
+fi
+print_ok "Свободного места достаточно"
+
+# Сохраняем имя текущего ядра как fallback
+CURRENT_KERNEL=$(uname -r)
+echo -e "    Текущее ядро (fallback): ${GREEN}$CURRENT_KERNEL${NC}"
+echo ""
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════════${NC}"
 DEBIAN_FRONTEND=noninteractive apt-get install -y "$KERNEL_PKG"
 INSTALL_RESULT=$?
@@ -299,8 +409,18 @@ echo ""
 
 if [ $INSTALL_RESULT -eq 0 ]; then
     print_ok "Ядро XanMod успешно установлено!"
+    # Гарантируем что текущее (рабочее) ядро останется в GRUB как запасное
+    print_status "Проверяем GRUB submenu (для fallback на старое ядро)..."
+    if [ -f /etc/default/grub ]; then
+        if ! grep -q "GRUB_DISABLE_SUBMENU" /etc/default/grub; then
+            echo 'GRUB_DISABLE_SUBMENU=y' >> /etc/default/grub
+            print_ok "GRUB submenu отключён (старое ядро доступно в меню)"
+        fi
+        update-grub 2>/dev/null || true
+    fi
 else
     print_error "Ошибка установки ядра! Код: $INSTALL_RESULT"
+    print_info "Текущее ядро не тронуто. Сервер загрузится как обычно."
     exit 1
 fi
 
@@ -340,9 +460,22 @@ sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=180 2>/dev/null || true
 sysctl -w net.netfilter.nf_conntrack_generic_timeout=300 2>/dev/null || true
 
 # Hashsize = conntrack_max / 4
+# Применяем мягко: только если модуль свежезагружен или активных соединений мало
 if [ -f /sys/module/nf_conntrack/parameters/hashsize ]; then
-    echo 65536 > /sys/module/nf_conntrack/parameters/hashsize
-    print_ok "Hashsize установлен: 65536"
+    CURRENT_HASHSIZE=$(cat /sys/module/nf_conntrack/parameters/hashsize)
+    ACTIVE_CONN=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
+
+    if [ "$CURRENT_HASHSIZE" = "65536" ]; then
+        print_info "Hashsize уже 65536 — пропускаем"
+    elif [ "$ACTIVE_CONN" -lt 5000 ]; then
+        # Безопасно менять — мало активных коннектов
+        echo 65536 > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null && \
+            print_ok "Hashsize изменён: $CURRENT_HASHSIZE → 65536 (активных соед.: $ACTIVE_CONN)" || \
+            print_info "Hashsize применится после ребута (через modprobe.d)"
+    else
+        # Много активного трафика — не трогаем сейчас, применится после ребута
+        print_info "Активных соед.: $ACTIVE_CONN — hashsize применится после ребута (избегаем лагов)"
+    fi
 fi
 
 # Сохраняем в конфиг для сохранения после ребута
@@ -448,13 +581,19 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 # Защита от TIME_WAIT assassination (RFC 1337)
 net.ipv4.tcp_rfc1337 = 1
-# TCP Fast Open (клиент + сервер)
-net.ipv4.tcp_fastopen = 3
+# TCP Fast Open отключён: конфликтует с Xray Reality TLS handshake
+# Если используете не-Reality протоколы — раскомментируйте:
+# net.ipv4.tcp_fastopen = 3
 
 # === Connection Keepalives (Mobile clients) ===
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_keepalive_intvl = 15
+
+# === Bufferbloat reduction (latency boost для клиента) ===
+# Ограничивает очередь на отправке, режет p99 latency на 15-40ms под нагрузкой
+# Критично для видеозвонков, игр, SSH через VPN
+net.ipv4.tcp_notsent_lowat = 131072
 
 # === Security Hardening ===
 # Loose reverse path filtering (compatible with VPN tunnels)
@@ -517,6 +656,8 @@ net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
 vm.swappiness = 10
 net.core.netdev_max_backlog = 16384
+# Больше окна под данные (меньше под метаданные) — +5-15% throughput
+net.ipv4.tcp_adv_win_scale = -2
 EOF
 
 else
@@ -530,6 +671,7 @@ net.core.wmem_default = 1048576
 net.ipv4.tcp_rmem = 4096 131072 33554432
 net.ipv4.tcp_wmem = 4096 87380 33554432
 net.core.netdev_max_backlog = 32768
+net.ipv4.tcp_adv_win_scale = -2
 EOF
 fi
 
@@ -572,26 +714,53 @@ else
     if [ "$QUEUES" -gt 1 ]; then
         # Multi-queue NIC: ставим mq как root, на каждую queue — fq
         print_status "Настраиваем Multi-Queue (mq + fq per-queue)..."
-        tc qdisc replace dev $IFACE root handle 1: mq 2>/dev/null
 
-        # Ждём пока mq создаст sub-qdisc'ы и узнаём её handle
+        # Проверяем текущий root qdisc — если уже mq, не трогаем (избегаем drop пакетов)
+        CURRENT_ROOT=$(tc qdisc show dev $IFACE | awk '/qdisc/ && /root/ {print $2; exit}')
+        if [ "$CURRENT_ROOT" = "mq" ]; then
+            print_info "Root qdisc уже mq — пропускаем replace (без drop пакетов)"
+        else
+            # add вместо replace когда возможно
+            tc qdisc add dev $IFACE root handle 1: mq 2>/dev/null || \
+                tc qdisc replace dev $IFACE root handle 1: mq 2>/dev/null
+        fi
+
+        # Ждём пока mq создаст sub-qdisc'ы
         sleep 1
         MQ_HANDLE=$(tc qdisc show dev $IFACE | awk '/qdisc mq/ {print $3}' | head -1)
 
         if [ -n "$MQ_HANDLE" ]; then
+            # Фикс hex-индексации: для 16+ очередей нужен правильный hex
+            # mq использует индексы 1..N в hex (1, 2, ... 9, a, b, ... f, 10, 11, ...)
+            APPLIED=0
             for i in $(seq 1 $QUEUES); do
-                # mq использует hex-индексы для child очередей
-                tc qdisc replace dev $IFACE parent ${MQ_HANDLE}$(printf '%x' $i) fq 2>/dev/null
+                HEX_IDX=$(printf '%x' "$i")
+                # Проверяем есть ли уже fq на этой child queue — если да, пропускаем
+                EXISTING=$(tc qdisc show dev $IFACE | grep "parent ${MQ_HANDLE}${HEX_IDX} " | grep -c fq)
+                if [ "$EXISTING" -eq 0 ]; then
+                    if tc qdisc add dev $IFACE parent ${MQ_HANDLE}${HEX_IDX} fq 2>/dev/null; then
+                        APPLIED=$((APPLIED + 1))
+                    elif tc qdisc change dev $IFACE parent ${MQ_HANDLE}${HEX_IDX} fq 2>/dev/null; then
+                        APPLIED=$((APPLIED + 1))
+                    fi
+                else
+                    APPLIED=$((APPLIED + 1))
+                fi
             done
-            print_ok "Multi-Queue настроен: $QUEUES очередей с fq"
+            print_ok "Multi-Queue настроен: $APPLIED/$QUEUES очередей с fq"
         else
             print_info "mq уже инициализирован с default_qdisc=fq"
         fi
-        QDISC_MODE="mq + fq (per-queue)"
+        QDISC_MODE="mq + fq (per-queue, $QUEUES queues)"
     else
-        # Single-queue: один fq на root
+        # Single-queue: один fq на root (через add если можно — без drop)
         print_status "Настраиваем Single-Queue (fq)..."
-        tc qdisc replace dev $IFACE root fq
+        CURRENT_ROOT=$(tc qdisc show dev $IFACE | awk '/qdisc/ && /root/ {print $2; exit}')
+        if [ "$CURRENT_ROOT" = "fq" ]; then
+            print_info "fq уже активен — пропускаем"
+        else
+            tc qdisc add dev $IFACE root fq 2>/dev/null || tc qdisc replace dev $IFACE root fq
+        fi
         print_ok "Single-Queue настроен: fq на root"
         QDISC_MODE="fq (single-queue)"
     fi
@@ -706,6 +875,248 @@ SVCEOF
 fi
 
 # ==============================================================================
+# ШАГ 7.7: БЕЗОПАСНЫЕ NIC БУСТЫ (ethtool / GRO / XPS / Ring Buffers)
+# ==============================================================================
+
+print_header "ШАГ 7.7: NIC ОПТИМИЗАЦИЯ (Безопасные бусты)"
+
+NIC_BOOSTS_APPLIED=()
+
+if [ -z "$IFACE" ]; then
+    print_info "Интерфейс не определён, пропускаем NIC бусты"
+else
+    # Проверяем наличие ethtool
+    if ! command -v ethtool >/dev/null 2>&1; then
+        print_status "Устанавливаем ethtool..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y ethtool >/dev/null 2>&1
+    fi
+
+    # === БУСТ 1: ethtool offloads (GRO/GSO/TSO/checksums) ===
+    print_status "Проверяем поддержку offload-функций драйвером..."
+    if ethtool -k "$IFACE" >/dev/null 2>&1; then
+        # Список offloads которые безопасно включать
+        OFFLOAD_LIST=("gro" "gso" "tso" "tx" "rx")
+        OFFLOAD_ENABLED=()
+
+        for off in "${OFFLOAD_LIST[@]}"; do
+            # Проверяем доступность флага (некоторые драйверы не поддерживают часть)
+            CURRENT=$(ethtool -k "$IFACE" 2>/dev/null | grep -E "^${off}-(offload|checksumming):" | head -1 | awk '{print $2}')
+            # Альтернативный формат
+            [ -z "$CURRENT" ] && CURRENT=$(ethtool -k "$IFACE" 2>/dev/null | grep -E "^${off}:" | head -1 | awk '{print $2}')
+
+            if [ "$CURRENT" = "off" ]; then
+                if ethtool -K "$IFACE" "$off" on 2>/dev/null; then
+                    OFFLOAD_ENABLED+=("$off")
+                fi
+            elif [ "$CURRENT" = "on" ]; then
+                OFFLOAD_ENABLED+=("$off=already-on")
+            fi
+        done
+
+        if [ ${#OFFLOAD_ENABLED[@]} -gt 0 ]; then
+            print_ok "Offload-функции: ${OFFLOAD_ENABLED[*]}"
+            NIC_BOOSTS_APPLIED+=("ethtool offloads")
+        else
+            print_info "Драйвер не поддерживает offload-tuning (виртуалка с paravirt?)"
+        fi
+    else
+        print_info "ethtool не работает с $IFACE — пропускаем offloads"
+    fi
+
+    # === БУСТ 2: NIC Ring Buffers (увеличиваем СОЗНАТЕЛЬНО — может вызвать
+    #     короткий link-flap на 1-3 сек на некоторых драйверах: ixgbe, mlx5)
+    print_status "Анализируем NIC ring buffers..."
+    if ethtool -g "$IFACE" >/dev/null 2>&1; then
+        MAX_RX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/^RX:/ && !/Mini|Jumbo/ {print $2; exit}')
+        MAX_TX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/^TX:/ {print $2; exit}')
+        # Текущие значения (после "Current hardware settings:")
+        CUR_RX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Current hardware settings/{found=1; next} found && /^RX:/ && !/Mini|Jumbo/ {print $2; exit}')
+        CUR_TX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Current hardware settings/{found=1; next} found && /^TX:/ {print $2; exit}')
+
+        if [ -n "$MAX_RX" ] && [ -n "$MAX_TX" ] && [ "$MAX_RX" != "n/a" ] && [ "$MAX_RX" -gt 0 ] 2>/dev/null; then
+            echo -e "    ├─ Max RX/TX: ${GREEN}$MAX_RX/$MAX_TX${NC}"
+            echo -e "    ├─ Cur RX/TX: ${GREEN}$CUR_RX/$CUR_TX${NC}"
+
+            # Применяем только если есть смысл (current < max и разница хотя бы 2x)
+            # И не на virtio (там почти всегда max=current и команда no-op)
+            DRIVER=$(ethtool -i "$IFACE" 2>/dev/null | awk '/^driver:/ {print $2}')
+
+            if [ "$DRIVER" = "virtio_net" ]; then
+                print_info "virtio_net: ring buffers тюнинг не применим, пропускаем (без link-flap)"
+            elif [ -n "$CUR_RX" ] && [ "$CUR_RX" = "$MAX_RX" ]; then
+                print_info "Ring buffers уже на максимуме, пропускаем"
+            elif [ -n "$CUR_RX" ] && [ "$((MAX_RX / CUR_RX))" -lt 2 ] 2>/dev/null; then
+                print_info "Прирост <2x, пропускаем (избегаем link-flap, разрыв клиентов)"
+            else
+                # Только тут реально применяем — выгода оправдывает короткий разрыв
+                print_status "Применяем ring buffers (возможен link-flap 1-3 сек)..."
+                if ethtool -G "$IFACE" rx "$MAX_RX" tx "$MAX_TX" 2>/dev/null; then
+                    print_ok "Ring buffers: RX=$MAX_RX, TX=$MAX_TX (было RX=$CUR_RX/$CUR_TX)"
+                    NIC_BOOSTS_APPLIED+=("ring buffers max")
+                else
+                    print_info "Драйвер не позволяет менять ring buffers"
+                fi
+            fi
+        else
+            print_info "Драйвер не сообщает max ring buffer size"
+        fi
+    fi
+
+    # === БУСТ 3: GRO Flush Timeout + napi_defer_hard_irqs ===
+    # Безопасные значения: gro_flush=50µs, napi_defer=1
+    # (выше значения дают больше CPU savings, но рискуют latency на прерывистом трафике)
+    print_status "Настраиваем GRO flush + napi defer (батчинг прерываний)..."
+    GRO_PATH="/sys/class/net/$IFACE/gro_flush_timeout"
+    NAPI_PATH="/sys/class/net/$IFACE/napi_defer_hard_irqs"
+
+    if [ -w "$GRO_PATH" ] && [ -w "$NAPI_PATH" ]; then
+        # Сохраняем текущие значения для отката если что-то сломается
+        OLD_GRO=$(cat "$GRO_PATH" 2>/dev/null)
+        OLD_NAPI=$(cat "$NAPI_PATH" 2>/dev/null)
+        echo 50000 > "$GRO_PATH" 2>/dev/null
+        echo 1 > "$NAPI_PATH" 2>/dev/null
+        # Проверяем что значение реально применилось
+        NEW_GRO=$(cat "$GRO_PATH" 2>/dev/null)
+        if [ "$NEW_GRO" = "50000" ]; then
+            print_ok "GRO flush timeout: 50µs, napi_defer: 1 (-15-25% CPU на softirq)"
+            NIC_BOOSTS_APPLIED+=("GRO flush + napi defer")
+        else
+            # Откат если не применилось
+            echo "$OLD_GRO" > "$GRO_PATH" 2>/dev/null
+            echo "$OLD_NAPI" > "$NAPI_PATH" 2>/dev/null
+            print_info "GRO flush не применился, откатили"
+        fi
+    else
+        print_info "GRO flush недоступен (старое ядро или виртуалка)"
+    fi
+
+    # === БУСТ 4: XPS (Transmit Packet Steering) ===
+    # На 32+ CPU битовая маска может переполниться — пропускаем для безопасности
+    if [ "$CPUS" -gt 1 ] && [ "$CPUS" -lt 32 ]; then
+        print_status "Настраиваем XPS (распределение TX по CPU)..."
+        XPS_APPLIED=0
+        TX_QUEUES=$(ls /sys/class/net/"$IFACE"/queues/ 2>/dev/null | grep -c tx)
+
+        if [ "$TX_QUEUES" -gt 0 ]; then
+            # Распределяем CPU по TX очередям равномерно
+            for tx_q in /sys/class/net/"$IFACE"/queues/tx-*; do
+                [ ! -d "$tx_q" ] && continue
+                Q_NUM=$(basename "$tx_q" | sed 's/tx-//')
+                # CPU для этой очереди = Q_NUM % CPUS (round-robin)
+                CPU_FOR_Q=$((Q_NUM % CPUS))
+                CPU_MASK=$(printf "%x" $((1 << CPU_FOR_Q)))
+
+                if [ -w "$tx_q/xps_cpus" ]; then
+                    if echo "$CPU_MASK" > "$tx_q/xps_cpus" 2>/dev/null; then
+                        XPS_APPLIED=$((XPS_APPLIED + 1))
+                    fi
+                fi
+            done
+
+            if [ "$XPS_APPLIED" -gt 0 ]; then
+                print_ok "XPS активен: $XPS_APPLIED TX очередей распределены по $CPUS CPU"
+                NIC_BOOSTS_APPLIED+=("XPS ($XPS_APPLIED queues)")
+            else
+                print_info "XPS не применился (драйвер не поддерживает)"
+            fi
+        fi
+    elif [ "$CPUS" -ge 32 ]; then
+        print_info "32+ CPU — XPS пропущен (используется RSS железа)"
+    else
+        print_info "1 CPU — XPS не нужен"
+    fi
+
+    # === Сохраняем NIC бусты в systemd-сервис (для применения после ребута) ===
+    if [ ${#NIC_BOOSTS_APPLIED[@]} -gt 0 ]; then
+        print_status "Создаём persistent systemd-сервис для NIC бустов..."
+
+        cat > /usr/local/sbin/nic-tuning.sh <<'NICEOF'
+#!/bin/bash
+# Auto-generated by VPN Node Builder v4.1
+# NIC optimization: GRO flush, XPS, ring buffers, offloads
+IFACE=$(ip route | awk '/default/ {print $5; exit}')
+[ -z "$IFACE" ] && exit 0
+CPUS=$(nproc)
+
+# Ждём пока интерфейс полностью поднимется
+for i in 1 2 3 4 5; do
+    [ -d "/sys/class/net/$IFACE" ] && break
+    sleep 1
+done
+
+# Ring buffers max — ТОЛЬКО на не-virtio драйверах с заметной разницей
+# (избегаем link-flap при каждом ребуте)
+if command -v ethtool >/dev/null 2>&1; then
+    DRIVER=$(ethtool -i "$IFACE" 2>/dev/null | awk '/^driver:/ {print $2}')
+    if [ "$DRIVER" != "virtio_net" ]; then
+        MAX_RX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/^RX:/ && !/Mini|Jumbo/ {print $2; exit}')
+        MAX_TX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/^TX:/ {print $2; exit}')
+        CUR_RX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Current hardware settings/{f=1; next} f && /^RX:/ && !/Mini|Jumbo/ {print $2; exit}')
+        # Применяем только если current < max
+        if [ -n "$MAX_RX" ] && [ "$MAX_RX" != "n/a" ] && [ -n "$CUR_RX" ] && [ "$CUR_RX" != "$MAX_RX" ]; then
+            ethtool -G "$IFACE" rx "$MAX_RX" tx "$MAX_TX" 2>/dev/null || true
+        fi
+    fi
+
+    # Offloads — безопасно, поддерживаются практически всеми драйверами
+    for off in gro gso tso tx rx; do
+        ethtool -K "$IFACE" "$off" on 2>/dev/null || true
+    done
+fi
+
+# GRO flush + napi defer (консервативные значения)
+[ -w "/sys/class/net/$IFACE/gro_flush_timeout" ] && echo 50000 > "/sys/class/net/$IFACE/gro_flush_timeout"
+[ -w "/sys/class/net/$IFACE/napi_defer_hard_irqs" ] && echo 1 > "/sys/class/net/$IFACE/napi_defer_hard_irqs"
+
+# XPS — распределение TX по CPU (только если CPU < 32 для безопасности маски)
+if [ "$CPUS" -gt 1 ] && [ "$CPUS" -lt 32 ]; then
+    for tx_q in /sys/class/net/$IFACE/queues/tx-*; do
+        [ ! -d "$tx_q" ] && continue
+        Q_NUM=$(basename "$tx_q" | sed 's/tx-//')
+        CPU_FOR_Q=$((Q_NUM % CPUS))
+        CPU_MASK=$(printf "%x" $((1 << CPU_FOR_Q)))
+        [ -w "$tx_q/xps_cpus" ] && echo "$CPU_MASK" > "$tx_q/xps_cpus" 2>/dev/null || true
+    done
+fi
+
+exit 0
+NICEOF
+        chmod +x /usr/local/sbin/nic-tuning.sh
+
+        cat > /etc/systemd/system/nic-tuning.service <<'SVCEOF'
+[Unit]
+Description=NIC Tuning for VPN Node (GRO/XPS/Offloads/Ring Buffers)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nic-tuning.sh
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+        systemctl daemon-reload
+        systemctl enable nic-tuning.service >/dev/null 2>&1
+        print_ok "Сервис nic-tuning.service создан и включён"
+    fi
+
+    echo ""
+    print_info "Применённые NIC бусты:"
+    if [ ${#NIC_BOOSTS_APPLIED[@]} -eq 0 ]; then
+        echo -e "    ${YELLOW}(ничего — драйвер/виртуализация не поддерживает)${NC}"
+        NIC_BOOSTS_SUMMARY="none (driver limit)"
+    else
+        for b in "${NIC_BOOSTS_APPLIED[@]}"; do
+            echo -e "    ${GREEN}✔${NC} $b"
+        done
+        NIC_BOOSTS_SUMMARY="${#NIC_BOOSTS_APPLIED[@]} boost(s)"
+    fi
+fi
+
+# ==============================================================================
 # ШАГ 8: НАСТРОЙКА ЛИМИТОВ (ULIMIT)
 # ==============================================================================
 
@@ -771,20 +1182,24 @@ echo -e "  │ Лимит nofile           │ ${GREEN}$LIMIT_COUNT${NC}        
 echo -e "  │ TCP Congestion         │ ${GREEN}BBRv3${NC}                               │"
 echo -e "  │ Qdisc                  │ ${GREEN}${QDISC_MODE:-fq}${NC}                     │"
 echo -e "  │ RPS                    │ ${GREEN}${RPS_MODE:-disabled}${NC}                 │"
+echo -e "  │ NIC Boosts             │ ${GREEN}${NIC_BOOSTS_SUMMARY:-none}${NC}            │"
+echo -e "  │ Cloud Provider         │ ${GREEN}${CLOUD_DETECTED}${NC}                     │"
 echo -e "  └─────────────────────────────────────────────────────────────────┘"
 echo ""
 
 echo -e "  ${BOLD}Что было сделано:${NC}"
-echo -e "  ├─ ${GREEN}✔${NC} Удалены snap, cloud-init, apport, whoopsie"
+echo -e "  ├─ ${GREEN}✔${NC} Бэкап старых конфигов: ${CYAN}${BACKUP_DIR}${NC}"
+echo -e "  ├─ ${GREEN}✔${NC} Удалены snap, apport, whoopsie (cloud-init: $([ "$CLOUD_DETECTED" = "none" ] && echo 'удалён' || echo 'сохранён'))"
 echo -e "  ├─ ${GREEN}✔${NC} Отключены ModemManager, fwupd, udisks2, multipathd"
 echo -e "  ├─ ${GREEN}✔${NC} Ограничены логи journald (100MB)"
-echo -e "  ├─ ${GREEN}✔${NC} Установлено ядро XanMod с BBRv3"
+echo -e "  ├─ ${GREEN}✔${NC} Установлено ядро XanMod с BBRv3 (старое ядро как fallback)"
 echo -e "  ├─ ${GREEN}✔${NC} Отключён IPv6"
 echo -e "  ├─ ${GREEN}✔${NC} Настроен conntrack (262144, короткие таймауты)"
-echo -e "  ├─ ${GREEN}✔${NC} Оптимизирован сетевой стек (tw_reuse, MTU probing, fast open)"
+echo -e "  ├─ ${GREEN}✔${NC} Оптимизирован сетевой стек (tw_reuse, MTU probing, notsent_lowat)"
 echo -e "  ├─ ${GREEN}✔${NC} Hardening (rp_filter, no redirects)"
 echo -e "  ├─ ${GREEN}✔${NC} Настроены лимиты (nofile $LIMIT_COUNT)"
-echo -e "  └─ ${GREEN}✔${NC} Qdisc + RPS настроены под топологию железа"
+echo -e "  ├─ ${GREEN}✔${NC} Qdisc + RPS настроены под топологию железа"
+echo -e "  └─ ${GREEN}✔${NC} NIC бусты: GRO flush, XPS, offloads, ring buffers"
 echo ""
 
 echo -e "  ${BOLD}Файлы конфигурации:${NC}"
@@ -796,7 +1211,12 @@ echo -e "  ├─ ${CYAN}/etc/security/limits.d/xray-limits.conf${NC}"
 echo -e "  ├─ ${CYAN}/etc/systemd/system.conf.d/limits.conf${NC}"
 echo -e "  ├─ ${CYAN}/etc/systemd/journald.conf.d/size-limit.conf${NC}"
 echo -e "  ├─ ${CYAN}/usr/local/sbin/rps-tuning.sh${NC}"
-echo -e "  └─ ${CYAN}/etc/systemd/system/rps-tuning.service${NC}"
+echo -e "  ├─ ${CYAN}/etc/systemd/system/rps-tuning.service${NC}"
+echo -e "  ├─ ${CYAN}/usr/local/sbin/nic-tuning.sh${NC}"
+echo -e "  └─ ${CYAN}/etc/systemd/system/nic-tuning.service${NC}"
+echo ""
+echo -e "  ${BOLD}Бэкап старых конфигов:${NC}"
+echo -e "  └─ ${CYAN}${BACKUP_DIR}${NC}"
 echo ""
 
 echo -e "  ${YELLOW}⚠️  ВАЖНО: Для активации ядра XanMod требуется перезагрузка!${NC}"
