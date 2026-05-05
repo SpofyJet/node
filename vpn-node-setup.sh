@@ -244,6 +244,21 @@ else
 fi
 echo ""
 
+# Определяем default интерфейс ОДИН РАЗ для использования во всех защитах
+DEFAULT_IFACE=""
+if command -v ip >/dev/null 2>&1; then
+    DEFAULT_IFACE=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
+fi
+# Fallback: ищем не-loopback интерфейс через /sys/class/net
+if [ -z "$DEFAULT_IFACE" ]; then
+    for ifc in /sys/class/net/*/; do
+        name=$(basename "$ifc")
+        [ "$name" = "lo" ] && continue
+        [ "$name" = "docker0" ] && continue
+        [ "$(cat "$ifc/operstate" 2>/dev/null)" = "up" ] && { DEFAULT_IFACE="$name"; break; }
+    done
+fi
+
 # --- Защита 1: Проверка netplan на несуществующие интерфейсы ---
 print_status "Проверяем netplan на корректность..."
 
@@ -255,13 +270,6 @@ if [ -d "$NETPLAN_DIR" ] && ls "$NETPLAN_DIR"/*.yaml >/dev/null 2>&1; then
     # Получаем список РЕАЛЬНО существующих сетевых интерфейсов
     REAL_IFACES=$(ls /sys/class/net/ 2>/dev/null | grep -vE '^(lo|docker|veth|br-|tun|tap|wg|sit|gre|virbr)' | tr '\n' ' ')
     print_info "Реальные интерфейсы: $REAL_IFACES"
-
-    # Получаем default интерфейс (через который идёт трафик)
-    DEFAULT_IFACE=""
-    if command -v ip >/dev/null 2>&1; then
-        DEFAULT_IFACE=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
-    fi
-    [ -z "$DEFAULT_IFACE" ] && DEFAULT_IFACE=$(echo "$REAL_IFACES" | awk '{print $1}')
 
     if [ -z "$DEFAULT_IFACE" ]; then
         print_info "Не удалось определить default интерфейс — пропускаем netplan check"
