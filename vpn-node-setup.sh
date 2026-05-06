@@ -1,109 +1,148 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v2.4 (Commercial Edition)
-#  - nftables rate-limit (kernel-level SYN flood protection)
-#  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
-#  - CrowdSec (SSH brute-force + community blocklist)
-#  - SSH-key auto-whitelist (опционально, с дебаунсом)
-#  - guard CLI — снимок состояния защиты (one-shot, no live updates)
-#  - Мгновенное отслеживание изменений в фаерволе через inotify
+#  ██╗  ██╗ █████╗ ███╗   ██╗███╗   ███╗ ██████╗ ██████╗ 
+#  ╚██╗██╔╝██╔══██╗████╗  ██║████╗ ████║██╔═══██╗██╔══██╗
+#   ╚███╔╝ ███████║██╔██╗ ██║██╔████╔██║██║   ██║██║  ██║
+#   ██╔██╗ ██╔══██║██║╚██╗██║██║╚██╔╝██║██║   ██║██║  ██║
+#  ██╔╝ ██╗██║  ██║██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝
+#  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ 
+#                                                         
+#  XRAY/REMNAWAVE NODE BUILDER v4.10 (All-in-One, MINIMAL-RISK EDITION)
+#  Ядро XanMod + BBRv3 + Полная оптимизация системы
+#  Поддерживает: Debian 12/13, Ubuntu 22.04/24.04
 #
-#  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
-#  Совместимо с активным UFW и любыми другими nft-таблицами.
+#  v4.10 — РАДИКАЛЬНОЕ УПРОЩЕНИЕ после реальных поломок на WaiCore.
+#  Принцип: если изменение МОЖЕТ повлиять на сеть/SSH/boot — НЕ ДЕЛАЕМ.
+#  Только syscall-настройки которые работают независимо от network stack.
 #
-#  v2.2 changelog:
-#    - ADD: автоматический whitelist management-IP из правил фаервола.
-#      Любое правило 'ufw allow X/tcp from <IP>' → IP попадает в
-#      manual_whitelist_v4 — он не подвергается rate-limit и сканер-проверкам.
-#      Это для случаев когда управляющий сервер (Marzban/3X-UI/Remnawave)
-#      делает много запросов к ноде. Раньше нужно было вручную добавлять
-#      `nft add element manual_whitelist_v4 { IP }` после установки.
-#    - ADD: management IP синхронизируются протекторс-вотчером каждые 60s
-#      (или мгновенно через path-unit при изменениях UFW).
+#  v4.10 что УДАЛЕНО (могло сломать сеть/boot):
+#  - Удалена вся pre-flight защита по сети:
+#    * netplan валидация и перезапись (Защита 1)
+#    * networking.service отключение (Защита 2)
+#    * fstab автодедуп (Защита 3) — заменено на warning
+#    * cloud-init zombie cleanup (Защита 4) — полностью удалён
+#    * GRUB_TIMEOUT правка (Защита 5) — заменено на warning
+#    * netplan accept-ra fix (Защита 8 v4.9) — главный виновник поломок
+#    * netplan installer-config нейтрализация (Защита 9 v4.9)
+#    * ifupdown disable (Защита 10 v4.9)
+#  - Удалён ШАГ 5: IPv6 disable через GRUB cmdline (трогает boot)
+#  - Удалён детект cloud-провайдера в ШАГ 2
+#  - cloud-init НЕ удаляется НИКОГДА (защита SSH ключей от пропажи)
+#  - snapd НЕ удаляется (может косвенно зависеть cloud-init)
 #
-#  v2.1 changelog (bugfixes):
-#    - FIX: guard показывал "—" в защищаемых портах если nft возвращал
-#      многострочный elements (порты переносились на новую строку при
-#      выводе). Парсер не учитывал переносы. Добавлен tr перед grep.
-#    - FIX: cs-ssh-whitelist падал в цикле restart из-за ProtectSystem=strict
-#      и попытки mkdir /run/cs-ssh-whitelist (debounce dir из v1.9).
-#      Добавлен RuntimeDirectory + ReadWritePaths.
+#  v4.10 что ОСТАЛОСЬ (безопасные оптимизации):
+#  - XanMod kernel + BBRv3 + post-install validation (initramfs/modules/NIC driver)
+#  - sysctl: TCP буферы по RAM, conntrack, notsent_lowat, inotify, hardening
+#  - IPv6 disable через sysctl (безопасный метод, не через GRUB)
+#  - qdisc fq/mq, RPS, NIC бусты (ethtool/GRO/XPS/IRQ affinity)
+#  - ulimit nofile, journald limit
+#  - Удаление apport/whoopsie/ubuntu-report/popularity-contest (точно безопасно)
+#  - Отключение ModemManager/fwupd/udisks2/multipathd/unattended-upgrades
+#  - dpkg integrity check (только проверка, не правит)
 #
-#  v2.0 changelog:
-#    - REMOVED: live-обновление дашборда (interactive mode с циклом).
-#      Причина: даже оптимизированный live-режим тратит CPU на постоянные
-#      nft list / cscli вызовы. На слабых VPS это заметно.
-#    - CHG: `guard` теперь по умолчанию выводит снимок один раз и выходит.
-#      Хочешь обновить — запусти ещё раз. Никакой фоновой нагрузки.
-#    - KEEP: `guard --json` для интеграций (один вызов = один JSON).
-#    - ADD: `guard --watch` для тех кто всё-таки хочет live-режим
-#      (используется через `watch -n 5 sudo guard`, нагрузка контролируется
-#      пользователем).
+#  v4.9 changelog (фикс reboot-проблем на KVM с virtio_net):
+#  - Fix: systemd-networkd-wait-online больше не падает по timeout.
+#    Корневая причина была не в --interface override, а в том что networkd
+#    ждёт IPv6 RA даже при dhcp6: false (NDISC link confirmation timeout 30с).
+#    Решение: accept-ra: false + link-local: [ ipv4 ] в netplan.
+#    БЕЗ optional: true — на Noble/Debian13 при ЕДИНСТВЕННОМ интерфейсе
+#    optional САМ ломает wait-online (Launchpad #2060311, #2060689).
+#  - Remove: старый wait-online override через --interface= (Защита 8).
+#    Он не помогал реальной проблеме — networkd всё равно застревал в
+#    "configuring" пока IPv6 RA таймаут не отработает.
+#  - Fix: дедуп /etc/fstab переписан. Старая логика по source+target
+#    пропускала /swapfile + /swapfile2. Теперь дедуп по type=swap.
+#  - Add: Защита 9 — нейтрализация /etc/netplan/00-installer-config.yaml
+#    когда есть наш 01-vpn-node-network.yaml. Subiquity-инсталлятор может
+#    в будущем перегенерировать его с битой ссылкой на enp1s0 (как в v4.0).
+#  - Add: Защита 10 — отключение /etc/network/interfaces (ifupdown) если
+#    непустой и активен systemd-networkd. Чинит ifup@ens3.service failed.
+#  - Note: все изменения netplan применяются в файл, БЕЗ netplan apply.
+#    Применятся при плановом ребуте после установки XanMod ядра.
 #
-#  v1.9 changelog (performance):
-#    - tiered refresh, sqlite3, JSON mode, debounce
+#  v4.8 changelog (полировка после реальных запусков):
+#  - Add: Защита 8 — systemd-networkd-wait-online override
+#    Создаёт override чтобы сервис ждал только default-интерфейс с timeout 30 сек.
+#    Применяется автоматически если: сервис в failed состоянии, были проблемы
+#    с netplan, или нашего override ещё нет. Не трогает admin-overrides.
+#  - Fix: точная проверка ipv6 модуля в инструкциях post-reboot (^ipv6 вместо ipv6)
+#  - Fix: точное описание судьбы cloud-init в финальном отчёте (учитывает был ли
+#    он zombie-state с самого начала, или удалён скриптом, или сохранён на cloud)
+#  - Fix: cosmetic — корректное сообщение для виртуалок без cloud-init
+#    (раньше говорил "bare-metal" даже на KVM/VMware)
+#  - Add: проверка systemctl --failed в post-reboot инструкции
 #
-#  v1.8 changelog:
-#    - CHG: protected-ports-update теперь работает в гибридном режиме:
-#      path-unit (inotify) + timer 60s (safety net)
+#  v4.7 changelog (расширенные защиты от поломок ребута):
+#  - Add: dpkg integrity check в начале pre-flight (останавливает скрипт если
+#    система в битом состоянии — лучше чем сделать хуже посреди установки ядра)
+#  - Add: GRUB_TIMEOUT минимум 2 сек (если был 0 — не было шанса recovery)
+#  - Add: VMware/Hyper-V предупреждение (XanMod может конфликтовать с старыми
+#    guest tools — авто-фикс невозможен, только информация)
+#  - Add: UFW информационное предупреждение (не трогаем правила, напоминаем проверить)
+#  - Add: POST-install validation НОВОГО ядра ДО update-grub:
+#    * initramfs целостность (размер >10MB, иначе update-initramfs -u)
+#    * /lib/modules/NEW/modules.dep (depmod -a если битый)
+#    * Драйвер NIC присутствует в новом ядре (предотвращает мёртвую сеть)
+#  - Add: nf_conntrack автозагрузка через /etc/modules-load.d/
 #
-#  v1.7 changelog:
-#    - REQUIRE: активный фаервол (UFW/iptables/firewalld)
-#    - CHG: защищаемые порты берутся из правил фаервола
-#    - ADD: автоматическое отслеживание изменений (timer 30 сек)
-#    - ADD: поддержка UDP (Hysteria2, TUIC, mKCP, QUIC, WireGuard)
+#  v4.6 changelog (PRE-FLIGHT защита от поломок после ребута):
+#  - Add: ШАГ 1.5 — pre-flight проверки сети и fstab перед изменениями
+#  - Add: Защита 1 — netplan валидация (находит ссылки на несуществующие интерфейсы
+#    типа enp1s0 когда реальный интерфейс ens3, и автоматически пересоздаёт конфиг)
+#  - Add: Защита 2 — отключение networking.service (ifupdown) когда он конфликтует
+#    с активным systemd-networkd (предотвращает гонку при загрузке)
+#  - Add: Защита 3 — удаление дубликатов в /etc/fstab (одинаковые точки монтирования
+#    вызывают ошибки systemd-fstab-generator при загрузке)
+#  - Add: Защита 4 — очистка zombie-cloud-init состояния (un / rc) — конфиги
+#    остающиеся после неполного удаления пакета
+#  - Refactor: BACKUP_DIR создаётся в начале скрипта (для использования в pre-flight)
 #
-#  v1.6 changelog:
-#    - ADD: команда `guard` — TUI-дашборд со статистикой
+#  v4.5 changelog:
+#  - Remove: GPG fingerprint verification (XanMod ротирует ключи, мешает работе)
+#    HTTPS-загрузка ключа от dl.xanmod.org остаётся как минимальная защита
 #
-#  v1.5 changelog (commercial fixes):
-#    - REM: обязательная проверка SSH-key авторизации в шаге 1
-#           (теперь скрипт работает с любым типом аутентификации)
-#    - REM: автоматическое отключение PasswordAuthentication
-#           (только показ предупреждения с инструкцией)
-#    - CHG: SSH-key auto-whitelist стал опциональным:
-#           * password-auth ON  → срабатывает только на publickey (безопасно)
-#           * password-auth OFF → срабатывает на любой вход (как было)
-#    - ADD: fallback статичный whitelist для текущего IP юзера
-#           (если ключа нет, хотя бы текущий IP в whitelist на 12h)
-#    - ADD: подробный summary в конце с рекомендациями по усилению защиты
-#    - CHG: исправлен путь к скрипту в команде uninstall (была /dev/fd/63)
+#  v4.4 changelog (IPv6-only optimization for IPv4-only nodes):
+#  - Change: IPv6 теперь отключается через GRUB cmdline (ipv6.disable=1)
+#    → модуль ipv6 НЕ загружается → меньше RAM, меньше attack surface
+#    → AF_INET6 socket() возвращает ошибку (приложения сразу идут на IPv4)
+#  - Add: автоматический бэкап /etc/default/grub перед изменением
+#  - Add: умный парсинг GRUB_CMDLINE_LINUX_DEFAULT (не перезаписывает существующие параметры)
+#  - Add: gai.conf precedence для приоритета IPv4 в getaddrinfo()
+#  - Keep: sysctl-конфиг как fallback (на случай если GRUB-метод не сработал)
 #
-#  v1.4 changelog (user-friendly fixes):
-#    - CHG: rate-limit 30/sec → 60/sec burst 100 (запас для CGNAT-юзеров)
-#    - CHG: ban duration 24h → 4h (меньше ущерба от ложных банов)
-#    - REM: коллекция crowdsecurity/iptables (ложно банила VPN-юзеров)
-#
-#  v1.3 changelog:
-#    - ADD: scanner_blocklist set в nft (Shodan, Censys, госсканеры)
-#    - ADD: systemd timer обновляет blocklist каждые 6 часов
-#    - ADD: --uninstall флаг
-#
-#  v1.2 changelog:
-#    - REPLACE: статичный IP-whitelist → SSH-key auto-whitelist
-#    - ADD: postoverflow parser, cs-ssh-whitelist service
-#
-#  v1.1 changelog:
-#    - ADD: коллекция crowdsecurity/sshd (ssh-cve-2024-6387)
-#
-#  Архитектура hook-приоритетов:
-#    prerouting -200: conntrack (системный)
-#    prerouting -100: НАШ ddos_protect (scanner_blocklist drop → rate-limit)
-#    input -10:       CrowdSec bouncer
-#    input  0:        UFW и пользовательские filter chains
-#
-#  Удаление: sudo bash vpn-node-ddos-protect-v1_5.sh --uninstall
-#
-#  РЕКОМЕНДАЦИЯ: для максимальной защиты после установки:
-#    1. Сгенерируй SSH-ключ на локальной машине: ssh-keygen -t ed25519
-#    2. Положи публичный ключ в /root/.ssh/authorized_keys на сервере
-#    3. Зайди по ключу, проверь что работает
-#    4. Выключи password-auth: sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && systemctl reload ssh
+#  v4.3 changelog (validated fixes):
+#  - Add: IRQ affinity round-robin (критично для 10G и multi-queue NIC)
+#  - Add: irqbalance integration (banned IRQs вместо отключения сервиса)
+#  - Add: IRQ affinity persisted в nic-tuning.sh (применяется после ребута)
+#  - Add: fs.inotify.max_user_watches=524288 (для 10k+ соединений Xray)
+#  - Add: fs.inotify.max_user_instances=8192
+#  - Fix: apt-get update проверяет exit code (раньше молча продолжал при сбое репо)
+#  - Fix: operator precedence в systemd-boot detection (скобки вокруг OR-условий)
+#  v4.2 changelog (safety fixes, оптимизация не снижена):
+#  - Fix: GPG ключ XanMod верифицируется по fingerprint перед установкой
+#  - Fix: GRUB обновляется только если grub-pc/grub-efi установлен (не systemd-boot)
+#  - Fix: sysctl --system заменён на явный список файлов (IPv6 не применяется до ребута)
+#  - Fix: journald restart через reload (без потери текущей сессии)
+#  - Fix: ring buffers применяются только при 4x+ выгоде (меньше link-flap риска)
+#  - Fix: swappiness = 10 добавлен во все профили (PERFORMANCE + ULTRA)
+#  - Fix: vm.min_free_kbytes добавлен во все профили
+#  - Fix: tcp_timestamps явно зафиксирован (безопасность tw_reuse)
+#  - Fix: source /etc/os-release заменён на безопасный grep
+#  v4.1 changelog:
+#  - Безопасные бусты: notsent_lowat, GRO flush, ethtool offloads, ring buffers, XPS
+#  - Fix: cloud-init detection (Hetzner/DO/Vultr/AWS) — не удаляем на облаках
+#  - Fix: убран tcp_fastopen=3 (конфликт с Xray Reality)
+#  - Fix: hashsize применяется мягко (без лагов на активном трафике)
+#  - Fix: qdisc через add/change вместо replace (без drop пакетов)
+#  - Fix: hex-индексация mq для 16+ очередей (10G NIC)
+#  - Fix: проверка свободного места + GRUB fallback на старое ядро
+#  - Fix: бэкап существующих sysctl/limits перед перезаписью
 # ==============================================================================
 
 set -o pipefail
 
+# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -112,6 +151,7 @@ MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# Функции вывода
 print_header() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
@@ -119,6 +159,7 @@ print_header() {
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
+
 print_status() { echo -e "${YELLOW}➤${NC} $1"; }
 print_ok()     { echo -e "${GREEN}✔${NC} $1"; }
 print_error()  { echo -e "${RED}✖${NC} $1"; }
@@ -126,2004 +167,1547 @@ print_info()   { echo -e "${MAGENTA}ℹ${NC} $1"; }
 print_warn()   { echo -e "${YELLOW}⚠${NC} $1"; }
 
 # ==============================================================================
-# UNINSTALL MODE
+# НАЧАЛО РАБОТЫ
 # ==============================================================================
 
-if [ "${1:-}" = "--uninstall" ]; then
-    if [[ $EUID -ne 0 ]]; then
-        print_error "FATAL: Запустите через sudo"
-        exit 1
-    fi
-
-    print_header "UNINSTALL: vpn-node-ddos-protect"
-
-    print_warn "Это удалит:"
-    echo "  - nft table inet ddos_protect (rate-limit + scanner-blocklist)"
-    echo "  - /etc/nftables.d/ddos-protect.conf"
-    echo "  - cs-ssh-whitelist.service + watcher script"
-    echo "  - scanner-blocklist updater + timer"
-    echo "  - postoverflow parser"
-    echo ""
-    echo "  НЕ удалит:"
-    echo "  - сам CrowdSec и bouncer (apt purge crowdsec вручную)"
-    echo "  - sshd-конфиг (PasswordAuthentication)"
-    echo "  - бэкапы в /root/vpn-ddos-backup-*"
-    echo ""
-    read -r -p "Продолжить? [y/N] " ANSWER
-    case "$ANSWER" in
-        y|Y|yes|YES) ;;
-        *) echo "Отмена."; exit 0 ;;
-    esac
-
-    # Systemd units
-    for unit in cs-ssh-whitelist scanner-blocklist-update.timer scanner-blocklist-update.service \
-                protected-ports-update.timer protected-ports-update.service \
-                protected-ports-update.path; do
-        systemctl disable --now "$unit" 2>/dev/null || true
-        rm -f "/etc/systemd/system/$unit"
-    done
-    systemctl daemon-reload
-    print_ok "Systemd units удалены"
-
-    # Scripts
-    rm -f /usr/local/sbin/cs-ssh-key-whitelist.sh
-    rm -f /usr/local/sbin/update-scanner-blocklist.sh
-    rm -f /usr/local/sbin/update-protected-ports.sh
-    rm -f /usr/local/bin/guard
-    print_ok "Скрипты удалены (включая команду guard)"
-
-    # CrowdSec parser
-    rm -f /etc/crowdsec/postoverflows/s01-whitelist/ssh-key-whitelist.yaml
-    # Старая UFW acquisition (от v1.1-1.3)
-    if [ -f /etc/crowdsec/acquis.d/ufw.yaml ] && \
-       grep -q "vpn-node-ddos-protect" /etc/crowdsec/acquis.d/ufw.yaml 2>/dev/null; then
-        rm -f /etc/crowdsec/acquis.d/ufw.yaml
-    fi
-    systemctl reload crowdsec 2>/dev/null || true
-    print_ok "Postoverflow parser удалён"
-
-    # nft table
-    nft delete table inet ddos_protect 2>/dev/null || true
-    rm -f /etc/nftables.d/ddos-protect.conf
-    # Убираем include из /etc/nftables.conf
-    if [ -f /etc/nftables.conf ]; then
-        sed -i '/# DDoS protection (vpn-node-ddos-protect)/d' /etc/nftables.conf
-        sed -i '\|include "/etc/nftables.d/ddos-protect.conf"|d' /etc/nftables.conf
-    fi
-    print_ok "nft правила удалены"
-
-    # cscli whitelist decisions
-    if command -v cscli >/dev/null 2>&1; then
-        cscli decisions delete --type whitelist >/dev/null 2>&1 || true
-        print_ok "Whitelist decisions очищены"
-    fi
-
-    print_header "UNINSTALL ЗАВЕРШЁН"
-    echo "Бэкапы остались в /root/vpn-ddos-backup-*"
-    exit 0
-fi
+clear
+echo -e "${CYAN}"
+echo "  ██╗  ██╗ █████╗ ███╗   ██╗███╗   ███╗ ██████╗ ██████╗ "
+echo "  ╚██╗██╔╝██╔══██╗████╗  ██║████╗ ████║██╔═══██╗██╔══██╗"
+echo "   ╚███╔╝ ███████║██╔██╗ ██║██╔████╔██║██║   ██║██║  ██║"
+echo "   ██╔██╗ ██╔══██║██║╚██╗██║██║╚██╔╝██║██║   ██║██║  ██║"
+echo "  ██╔╝ ██╗██║  ██║██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝"
+echo "  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ "
+echo -e "${NC}"
+echo -e "${BOLD}  XRAY/REMNAWAVE NODE BUILDER v4.10 (Minimal-Risk Edition)${NC}"
+echo -e "  ${YELLOW}XanMod + BBRv3 + Очистка + Сетевой стек + Conntrack + Gaming-friendly${NC}"
+echo -e "  ${GREEN}+ Safe boosts: notsent_lowat, GRO, ethtool, XPS, IRQ affinity${NC}"
+echo ""
+sleep 1
 
 # ==============================================================================
-# ШАГ 1: ПРОВЕРКИ
+# ШАГ 1: ПРОВЕРКИ БЕЗОПАСНОСТИ
 # ==============================================================================
 
-print_header "ШАГ 1: ПРОВЕРКИ"
+print_header "ШАГ 1: ПРОВЕРКИ БЕЗОПАСНОСТИ"
 
+# Проверка root
+print_status "Проверяем права root..."
 if [[ $EUID -ne 0 ]]; then
-    print_error "FATAL: Запустите через sudo"
+    print_error "FATAL: Запустите скрипт через sudo!"
     exit 1
 fi
 print_ok "Запущен от root"
 
-if ! command -v nft >/dev/null 2>&1; then
-    print_status "Устанавливаю nftables..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y nftables >/dev/null 2>&1 || {
-        print_error "Не удалось установить nftables"
+# Проверка архитектуры
+print_status "Проверяем архитектуру..."
+ARCH=$(uname -m)
+if [[ "$ARCH" != "x86_64" ]]; then
+    print_error "FATAL: Скрипт поддерживает только x86_64! Обнаружено: $ARCH"
+    exit 1
+fi
+print_ok "Архитектура: $ARCH"
+
+# Проверка виртуализации
+print_status "Определяем тип виртуализации..."
+if command -v systemd-detect-virt >/dev/null; then
+    VIRT=$(systemd-detect-virt)
+    echo -e "    Виртуализация: ${BOLD}$VIRT${NC}"
+
+    if [[ "$VIRT" == "lxc" || "$VIRT" == "openvz" || "$VIRT" == "docker" ]]; then
+        print_error "STOP: Виртуализация $VIRT не поддерживает замену ядра!"
+        echo -e "    ${RED}Скрипт остановлен для защиты системы.${NC}"
         exit 1
-    }
-fi
-print_ok "nftables: $(nft --version 2>&1 | head -1)"
-
-# v1.9: sqlite3 для быстрого чтения crowdsec БД в guard'е
-# (опционально — fallback на cscli если не установится)
-if ! command -v sqlite3 >/dev/null 2>&1; then
-    print_status "Устанавливаю sqlite3 (для оптимизации guard)..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 >/dev/null 2>&1 || \
-        print_warn "sqlite3 не установлен — guard будет использовать cscli (медленнее)"
-fi
-
-# v2.4: jq для парсинга nft -j вывода в guard
-if ! command -v jq >/dev/null 2>&1; then
-    print_status "Устанавливаю jq (для парсинга nft JSON в guard)..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y jq >/dev/null 2>&1 || \
-        print_warn "jq не установлен — guard будет использовать text-парсинг (хрупко)"
-fi
-
-if ! nft list ruleset >/dev/null 2>&1; then
-    print_error "nft list ruleset не работает — нет ядерных модулей nftables"
-    print_error "Это бывает на OpenVZ/LXC. На KVM не должно встречаться."
-    exit 1
-fi
-print_ok "nftables ядерные модули работают"
-
-# v1.5: проверим какой метод auth — но НЕ блокируем установку.
-# Скрипт работает с любым типом, просто на разных уровнях защиты.
-# Используется глобальная переменная USES_KEY_AUTH в шагах 3 и 7.
-USES_KEY_AUTH=0
-CURRENT_AUTH_METHOD=""
-if [ -n "${SSH_CONNECTION:-}" ] && [ -n "${PPID:-}" ]; then
-    SSH_PID=$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')
-    if [ -n "$SSH_PID" ]; then
-        CURRENT_AUTH_METHOD=$(journalctl _PID="$SSH_PID" --no-pager 2>/dev/null | \
-            grep -oE "Accepted (publickey|password|keyboard-interactive)" | \
-            head -1 | awk '{print $2}')
     fi
-fi
-
-if [ "$CURRENT_AUTH_METHOD" = "publickey" ]; then
-    print_ok "Текущая SSH-сессия по ключу — максимальная защита будет включена"
-    USES_KEY_AUTH=1
-elif [ "$CURRENT_AUTH_METHOD" = "password" ] || [ "$CURRENT_AUTH_METHOD" = "keyboard-interactive" ]; then
-    print_warn "Текущая SSH-сессия по ПАРОЛЮ"
-    print_info "Скрипт продолжит установку. Защита будет работать, но НЕ на максимуме."
-    print_info "После установки рекомендую перейти на SSH-ключи (см. итоги в конце)."
-elif [ -n "${SSH_CONNECTION:-}" ]; then
-    print_info "Метод аутентификации не определён, продолжаю"
+    print_ok "Виртуализация совместима"
 else
-    print_info "Запуск с локальной консоли — продолжаю"
+    print_info "systemd-detect-virt не найден, пропускаем проверку"
 fi
 
-# v1.7: ПРОВЕРКА ФАЕРВОЛА — обязательное требование
-# Логика: скрипт работает поверх существующего фаервола, защищая порты
-# которые юзер УЖЕ открыл. Без активного фаервола сервер открыт всему миру,
-# и наш скрипт это не исправит — нужен базовый layer.
-#
-# Поддерживаются: UFW (приоритет), firewalld, iptables/nftables-rules.
-# Тип фаервола сохраняется в FIREWALL_TYPE для шага 2.
-
-FIREWALL_TYPE=""
-
-# Проверка UFW
-if command -v ufw >/dev/null 2>&1; then
-    if ufw status 2>/dev/null | grep -q "Status: active"; then
-        FIREWALL_TYPE="ufw"
-        UFW_RULES_COUNT=$(ufw status numbered 2>/dev/null | grep -cE "^\[ ?[0-9]+\]")
-        print_ok "Фаервол: ${BOLD}UFW активен${NC} (${UFW_RULES_COUNT} правил)"
-    fi
+# Информация о системе
+print_status "Собираем информацию о системе..."
+echo ""
+echo -e "    ${BOLD}Операционная система:${NC}"
+if [ -f /etc/os-release ]; then
+    OS_NAME=$(grep '^NAME=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    OS_VERSION=$(grep '^VERSION=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    echo -e "    ├─ Дистрибутив: ${GREEN}${OS_NAME:-unknown}${NC}"
+    echo -e "    ├─ Версия: ${GREEN}${OS_VERSION:-unknown}${NC}"
 fi
+echo -e "    ├─ Ядро: ${GREEN}$(uname -r)${NC}"
+echo -e "    └─ Архитектура: ${GREEN}$(uname -m)${NC}"
+echo ""
 
-# Проверка firewalld
-if [ -z "$FIREWALL_TYPE" ] && command -v firewall-cmd >/dev/null 2>&1; then
-    if systemctl is-active --quiet firewalld 2>/dev/null; then
-        FIREWALL_TYPE="firewalld"
-        FW_PORTS_COUNT=$(firewall-cmd --list-ports 2>/dev/null | wc -w)
-        print_ok "Фаервол: ${BOLD}firewalld активен${NC} (${FW_PORTS_COUNT} портов)"
-    fi
-fi
-
-# Проверка iptables (если правила есть и они не дефолтные ACCEPT)
-if [ -z "$FIREWALL_TYPE" ] && command -v iptables >/dev/null 2>&1; then
-    # Считаем правила в INPUT chain. Если только дефолт — это не защита.
-    IPT_RULES=$(iptables -L INPUT --line-numbers 2>/dev/null | grep -cE "^[0-9]+")
-    IPT_POLICY=$(iptables -L INPUT 2>/dev/null | head -1 | grep -oE "policy [A-Z]+" | awk '{print $2}')
-    if [ "$IPT_RULES" -gt 0 ] || [ "$IPT_POLICY" = "DROP" ] || [ "$IPT_POLICY" = "REJECT" ]; then
-        FIREWALL_TYPE="iptables"
-        print_ok "Фаервол: ${BOLD}iptables активен${NC} ($IPT_RULES правил, policy=$IPT_POLICY)"
-    fi
-fi
-
-# Проверка nftables (кастомные filter chains, не наш ddos_protect)
-if [ -z "$FIREWALL_TYPE" ]; then
-    NFT_FILTER=$(nft list ruleset 2>/dev/null | \
-        awk '/^table inet filter|^table ip filter|^table ip6 filter/{found=1} END{print found}')
-    if [ "$NFT_FILTER" = "1" ]; then
-        FIREWALL_TYPE="nftables"
-        print_ok "Фаервол: ${BOLD}nftables filter table активен${NC}"
-    fi
-fi
-
-# Если ни одного фаервола не найдено — отказываемся ставиться
-if [ -z "$FIREWALL_TYPE" ]; then
-    print_error ""
-    print_error "ФАЕРВОЛ НЕ НАСТРОЕН — установка невозможна"
-    print_error ""
-    print_warn "Этот скрипт защищает порты которые ты ОТКРЫЛ в фаерволе."
-    print_warn "Без фаервола сервер открыт всему интернету, и DDoS-защита не поможет."
-    print_warn ""
-    print_warn "Сначала настрой фаервол. Самый простой вариант — UFW:"
-    print_info "  ${BOLD}apt install ufw${NC}"
-    print_info "  ${BOLD}ufw allow 22/tcp comment 'SSH'${NC}      # порт SSH (важно!)"
-    print_info "  ${BOLD}ufw allow 443${NC}                     # порт VPN (Reality/etc)"
-    print_info "  ${BOLD}ufw allow 8443${NC}                    # резервный VPN-порт (опционально)"
-    print_info "  ${BOLD}ufw --force enable${NC}                # активировать"
-    print_info "  ${BOLD}ufw status${NC}                        # проверить"
-    print_warn ""
-    print_warn "Когда UFW активен, запусти этот скрипт повторно."
-    print_warn "Скрипт защитит ВСЕ порты которые ты открыл (кроме SSH)."
-    exit 1
-fi
-
-BACKUP_DIR="/root/vpn-ddos-backup-$(date +%Y%m%d-%H%M%S)"
+# Инициализируем BACKUP_DIR заранее (используется в pre-flight шагах ниже)
+BACKUP_DIR="/root/vpn-node-builder-backup-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
-nft list ruleset > "$BACKUP_DIR/nft-ruleset.before" 2>/dev/null || true
-print_ok "Бэкап текущих nft-правил: $BACKUP_DIR/nft-ruleset.before"
 
 # ==============================================================================
-# ШАГ 2: AUTO-DETECT (порты из фаервола, SSH порт, IP)
+# ШАГ 1.5: PRE-FLIGHT CHECKS (минимальный, без правок сети)
 # ==============================================================================
 
-print_header "ШАГ 2: AUTO-DETECT"
+print_header "ШАГ 1.5: PRE-FLIGHT ПРОВЕРКИ"
 
-# v1.7: порты берутся из ПРАВИЛ ФАЕРВОЛА. Юзер сам решил что открыть —
-# это и защищаем. SSH-порт исключаем (он защищается CrowdSec'ом и не
-# должен попадать под rate-limit для VPN-клиентов).
+# v4.10: радикально упрощено после поломок на WaiCore.
+# Принцип: ничего не правим автоматически в сети/netplan/fstab/cloud-init.
+# Только проверяем критичные вещи и предупреждаем — пусть админ решает сам.
 
-# Функция возвращает порты из UFW в формате "tcp,tcp,udp..." парами через |
-# Stdout: две строки
-#   1. TCP-порты через запятую
-#   2. UDP-порты через запятую
-detect_firewall_ports() {
-    local fw="$1"
-    local tcp_list=""
-    local udp_list=""
-    local mgmt_ipv4=""
-    local mgmt_ipv6=""
+# --- Проверка 0: dpkg integrity (КРИТИЧНО для установки ядра) ---
+# Если dpkg в битом состоянии — установка XanMod упадёт посреди процесса
+# и оставит систему в нерабочем состоянии. Лучше остановиться здесь.
+print_status "Проверяем целостность dpkg (apt database)..."
 
-    case "$fw" in
-        ufw)
-            # ufw status: "443/tcp ALLOW IN Anywhere", "443 ALLOW IN ..." (без proto = TCP+UDP)
-            local ufw_out
-            ufw_out=$(ufw status 2>/dev/null)
-            # Парсим строки с ALLOW для не-v6 (v6-правила дублируют v4 в UFW по умолчанию)
-            tcp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
-                    pp = $1
-                    if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
-                        n = split(pp, a, "/")
-                        port = a[1]
-                        proto = (n > 1) ? a[2] : "any"
-                        if (proto == "tcp" || proto == "any") print port
-                    }
-                }
-            ' | sort -un | tr '\n' ',' | sed 's/,$//')
-
-            udp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
-                    pp = $1
-                    if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
-                        n = split(pp, a, "/")
-                        port = a[1]
-                        proto = (n > 1) ? a[2] : "any"
-                        if (proto == "udp" || proto == "any") print port
-                    }
-                }
-            ' | sort -un | tr '\n' ',' | sed 's/,$//')
-
-            # v2.2: management IPs из правил "ALLOW from <IP>"
-            # Формат: "2222/tcp  ALLOW  213.165.55.166" (3й колонкой идёт IP вместо Anywhere)
-            mgmt_ipv4=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 != "Anywhere" {
-                    if ($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) print $3
-                }
-            ' | sort -u | tr '\n' ',' | sed 's/,$//')
-
-            mgmt_ipv6=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" {
-                    if ($3 ~ /:/ && $3 !~ /^Anywhere/) print $3
-                }
-            ' | sort -u | tr '\n' ',' | sed 's/,$//')
-            ;;
-
-        firewalld)
-            # firewall-cmd --list-ports выдаёт "443/tcp 8443/tcp 36789/udp"
-            local fw_out
-            fw_out=$(firewall-cmd --list-ports 2>/dev/null)
-            tcp_list=$(echo "$fw_out" | tr ' ' '\n' | awk -F/ '$2=="tcp"{print $1}' | sort -un | tr '\n' ',' | sed 's/,$//')
-            udp_list=$(echo "$fw_out" | tr ' ' '\n' | awk -F/ '$2=="udp"{print $1}' | sort -un | tr '\n' ',' | sed 's/,$//')
-
-            # Также добавим порты из --list-services (ssh=22, http=80, https=443 и т.д.)
-            local services
-            services=$(firewall-cmd --list-services 2>/dev/null)
-            for svc in $services; do
-                local svc_ports
-                svc_ports=$(firewall-cmd --info-service="$svc" 2>/dev/null | awk '/ports:/{$1="";print}' | xargs)
-                for sp in $svc_ports; do
-                    local p="${sp%/*}"
-                    local pr="${sp#*/}"
-                    if [ "$pr" = "tcp" ]; then
-                        tcp_list="${tcp_list:+$tcp_list,}$p"
-                    elif [ "$pr" = "udp" ]; then
-                        udp_list="${udp_list:+$udp_list,}$p"
-                    fi
-                done
-            done
-            tcp_list=$(echo "$tcp_list" | tr ',' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
-            udp_list=$(echo "$udp_list" | tr ',' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
-            ;;
-
-        iptables)
-            # iptables -S INPUT: ищем "-A INPUT -p tcp --dport 443 -j ACCEPT"
-            tcp_list=$(iptables -S INPUT 2>/dev/null | \
-                awk '/-j ACCEPT/ && /-p tcp/ {
-                    for (i=1; i<=NF; i++) {
-                        if ($i == "--dport") print $(i+1)
-                        if ($i == "--dports") print $(i+1)
-                    }
-                }' | tr ',' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
-
-            udp_list=$(iptables -S INPUT 2>/dev/null | \
-                awk '/-j ACCEPT/ && /-p udp/ {
-                    for (i=1; i<=NF; i++) {
-                        if ($i == "--dport") print $(i+1)
-                        if ($i == "--dports") print $(i+1)
-                    }
-                }' | tr ',' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
-            ;;
-
-        nftables)
-            # nft -j: ищем accept-правила с tcp/udp dport
-            local nft_json
-            nft_json=$(nft -j list ruleset 2>/dev/null)
-            if [ -n "$nft_json" ] && command -v jq >/dev/null 2>&1; then
-                tcp_list=$(echo "$nft_json" | jq -r '
-                    .nftables[] | select(.rule?) | .rule
-                    | select(any(.expr[]?; .accept))
-                    | .expr[] | select(.match?)
-                    | select(.match.left.payload.protocol == "tcp")
-                    | .match.right
-                    | if type == "object" and .set then .set[] elif type == "array" then .[] else . end
-                    | tostring
-                ' 2>/dev/null | grep -E '^[0-9]+$' | sort -un | tr '\n' ',' | sed 's/,$//')
-
-                udp_list=$(echo "$nft_json" | jq -r '
-                    .nftables[] | select(.rule?) | .rule
-                    | select(any(.expr[]?; .accept))
-                    | .expr[] | select(.match?)
-                    | select(.match.left.payload.protocol == "udp")
-                    | .match.right
-                    | if type == "object" and .set then .set[] elif type == "array" then .[] else . end
-                    | tostring
-                ' 2>/dev/null | grep -E '^[0-9]+$' | sort -un | tr '\n' ',' | sed 's/,$//')
-            fi
-            # Fallback: regex-парсинг если jq не установлен
-            if [ -z "$tcp_list" ] && [ -z "$udp_list" ]; then
-                local rules
-                rules=$(nft list ruleset 2>/dev/null | grep -E "(tcp|udp) dport" | grep "accept")
-                tcp_list=$(echo "$rules" | grep "tcp dport" | grep -oE 'dport [{0-9 ,}]+' | \
-                    grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
-                udp_list=$(echo "$rules" | grep "udp dport" | grep -oE 'dport [{0-9 ,}]+' | \
-                    grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
-            fi
-            ;;
-    esac
-
-    echo "$tcp_list"
-    echo "$udp_list"
-    echo "$mgmt_ipv4"
-    echo "$mgmt_ipv6"
-}
-
-# Получаем сырые списки портов из фаервола
-FW_OUTPUT=$(detect_firewall_ports "$FIREWALL_TYPE")
-RAW_TCP=$(echo "$FW_OUTPUT" | sed -n '1p')
-RAW_UDP=$(echo "$FW_OUTPUT" | sed -n '2p')
-MGMT_IPV4=$(echo "$FW_OUTPUT" | sed -n '3p')
-MGMT_IPV6=$(echo "$FW_OUTPUT" | sed -n '4p')
-
-# Определяем SSH порт чтобы исключить его из защиты
-SSH_PORT=$(ss -tlnpH 2>/dev/null | awk '
-    /users:\(.*"sshd"/ {
-        split($4, a, ":")
-        port = a[length(a)]
-        if ($4 ~ /^127\./ || $4 ~ /^\[::1\]/) next
-        print port
-        exit
-    }
-')
-SSH_PORT="${SSH_PORT:-22}"
-
-# Исключаем SSH из списков защищаемых портов
-exclude_port() {
-    local list="$1" exclude="$2"
-    echo ",$list," | sed "s/,$exclude,/,/g; s/^,//; s/,$//"
-}
-
-PROTECTED_TCP=$(exclude_port "$RAW_TCP" "$SSH_PORT")
-PROTECTED_UDP="$RAW_UDP"  # UDP SSH не использует, исключать не нужно
-
-# Печать результатов
-print_ok "SSH порт: ${BOLD}$SSH_PORT${NC} (исключён из защиты)"
-
-if [ -n "$PROTECTED_TCP" ]; then
-    print_ok "Защищаемые TCP-порты: ${BOLD}$PROTECTED_TCP${NC}"
-else
-    print_warn "В фаерволе нет открытых TCP-портов кроме SSH"
-fi
-
-if [ -n "$PROTECTED_UDP" ]; then
-    print_ok "Защищаемые UDP-порты: ${BOLD}$PROTECTED_UDP${NC}"
-else
-    print_info "В фаерволе нет открытых UDP-портов (Hysteria/TUIC/QUIC будет нечего защищать)"
-fi
-
-# v2.2: автоматический whitelist для management-IP (правила "ALLOW from <IP>")
-if [ -n "$MGMT_IPV4" ]; then
-    print_ok "Management IPv4 (auto-whitelist): ${BOLD}$MGMT_IPV4${NC}"
-fi
-if [ -n "$MGMT_IPV6" ]; then
-    print_ok "Management IPv6 (auto-whitelist): ${BOLD}$MGMT_IPV6${NC}"
-fi
-
-if [ -z "$PROTECTED_TCP" ] && [ -z "$PROTECTED_UDP" ]; then
-    print_error ""
-    print_error "В фаерволе нет открытых портов (кроме SSH)."
-    print_error "Скрипту нечего защищать. Открой VPN-порт в фаерволе и запусти повторно."
-    print_info "Пример: ${BOLD}ufw allow 443${NC}"
-    exit 1
-fi
-
-# Объединяем для совместимости (старые места в скрипте)
-XRAY_PORTS_TCP="$PROTECTED_TCP"
-XRAY_PORTS_UDP="$PROTECTED_UDP"
-XRAY_PORTS=$(echo "${XRAY_PORTS_TCP},${XRAY_PORTS_UDP}" | tr ',' '\n' | grep -v '^$' | sort -un | tr '\n' ',' | sed 's/,$//')
-
-# v2.2: management IPs для nft set
-MANUAL_WHITELIST_V4_INIT=""
-MANUAL_WHITELIST_V6_INIT=""
-if [ -n "$MGMT_IPV4" ]; then
-    MANUAL_WHITELIST_V4_INIT="        elements = { $(echo "$MGMT_IPV4" | sed 's/,/, /g') }"
-fi
-if [ -n "$MGMT_IPV6" ]; then
-    MANUAL_WHITELIST_V6_INIT="        elements = { $(echo "$MGMT_IPV6" | sed 's/,/, /g') }"
-fi
-
-# Инициализирующие elements для nft-set
-nft_set_init() {
-    local list="$1"
-    if [ -z "$list" ]; then
-        echo ""
-    else
-        echo "        elements = { $(echo "$list" | sed 's/,/, /g') }"
+DPKG_AUDIT_OUT=$(dpkg --audit 2>&1)
+if [ -n "$DPKG_AUDIT_OUT" ]; then
+    print_warn "dpkg обнаружил незавершённые операции:"
+    echo "$DPKG_AUDIT_OUT" | head -10 | sed 's/^/    /'
+    echo ""
+    print_status "Пытаюсь восстановить через 'dpkg --configure -a'..."
+    if dpkg --configure -a 2>&1 | tail -20; then
+        DPKG_AUDIT_OUT=$(dpkg --audit 2>&1)
+        if [ -n "$DPKG_AUDIT_OUT" ]; then
+            print_error "dpkg всё ещё в битом состоянии"
+            print_error "Прерывание установки — установка ядра упадёт и сделает хуже"
+            print_info "Решите проблему вручную:"
+            print_info "  1. dpkg --configure -a"
+            print_info "  2. apt-get install -f"
+            print_info "  3. Если упорно битый файл: rm /var/lib/dpkg/updates/*"
+            exit 1
+        fi
+        print_ok "dpkg восстановлен"
     fi
-}
-
-XRAY_PORTS_TCP_INIT=$(nft_set_init "$XRAY_PORTS_TCP")
-XRAY_PORTS_UDP_INIT=$(nft_set_init "$XRAY_PORTS_UDP")
-
-# --- Текущий админский IP (для bootstrap-whitelist) ---
-ADMIN_IP=""
-if [ -n "${SSH_CLIENT:-}" ]; then
-    ADMIN_IP=$(echo "$SSH_CLIENT" | awk '{print $1}')
-elif [ -n "${SSH_CONNECTION:-}" ]; then
-    ADMIN_IP=$(echo "$SSH_CONNECTION" | awk '{print $1}')
 else
-    ADMIN_IP=$(who -m 2>/dev/null | grep -oE '\([^)]+\)' | tr -d '()' | head -1)
+    print_ok "dpkg в порядке"
+fi
+echo ""
+
+# --- Проверка: GRUB_TIMEOUT (только warning, не правим) ---
+# Если GRUB_TIMEOUT=0 — после неудачной загрузки нового ядра нет шанса
+# выбрать старое из меню. v4.10 не правит автоматически — только предупреждает.
+if [ -f /etc/default/grub ]; then
+    CURRENT_TIMEOUT=$(grep -E '^GRUB_TIMEOUT=' /etc/default/grub | head -1 | cut -d= -f2 | tr -d '"' | tr -d "'")
+    if [ -n "$CURRENT_TIMEOUT" ] && [ "$CURRENT_TIMEOUT" -eq 0 ] 2>/dev/null; then
+        print_warn "GRUB_TIMEOUT=0 — нет возможности выбрать старое ядро через console"
+        print_info "Если новое ядро не загрузится — потребуется hard reset"
+        print_info "Рекомендация (применить ВРУЧНУЮ если хочешь):"
+        print_info "  sed -i 's/^GRUB_TIMEOUT=0/GRUB_TIMEOUT=2/' /etc/default/grub && update-grub"
+    else
+        print_ok "GRUB_TIMEOUT=$CURRENT_TIMEOUT (recovery возможен)"
+    fi
 fi
 
-case "$ADMIN_IP" in
-    ""|localhost|127.0.0.1|::1) ADMIN_IP="" ;;
-    *[!0-9.:]*) ADMIN_IP="" ;;
+# --- Проверка: VMware/Hyper-V предупреждение ---
+VIRT_TYPE=$(systemd-detect-virt 2>/dev/null)
+case "$VIRT_TYPE" in
+    "vmware")
+        print_warn "Обнаружен VMware. XanMod ядро может конфликтовать со старыми VMware Tools."
+        print_info "Если после ребута возникнут проблемы — обновите open-vm-tools"
+        ;;
+    "microsoft")
+        print_warn "Обнаружен Hyper-V. Возможны проблемы с интеграционными сервисами на новом ядре."
+        print_info "Если возникнут — переустановите hyperv-daemons после ребута"
+        ;;
 esac
 
-if [ -n "$ADMIN_IP" ]; then
-    print_ok "Текущий админский IP: ${BOLD}$ADMIN_IP${NC} (bootstrap-whitelist на 12h)"
-else
-    print_warn "Не удалось определить админский IP (запуск не через SSH)"
-    print_info "Это ок если ты на локальной консоли. Whitelist начнёт работать"
-    print_info "после первого SSH-коннекта по ключу."
+# --- Проверка: UFW информационная (не трогаем правила) ---
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    print_warn "UFW активен — проверьте после оптимизации:"
+    print_info "  • Что Xray/Remnawave порты разрешены (Reality 443, XHTTP 8443 и т.д.)"
+    print_info "  • Команда: ufw status verbose"
 fi
 
-# ==============================================================================
-# ШАГ 3: ПРОВЕРКА КОНФИГА SSH (информационная, не блокирует установку)
-# ==============================================================================
-
-print_header "ШАГ 3: ПРОВЕРКА КОНФИГА SSH"
-
-# v1.5: проверка SSH-конфига больше не интерактивная и не блокирующая.
-# Просто показываем текущее состояние и рекомендации в конце скрипта.
-# Юзер сам решит когда и как переходить на ключи.
-
-# Глобальные переменные для использования в шагах 7 и 12 (summary)
-SSHD_PASSWORD_AUTH_ENABLED=0
-SSHD_PUBKEY_AUTH_ENABLED=1
-
-SSHD_CONFIG="/etc/ssh/sshd_config"
-SSHD_EFFECTIVE=$(sshd -T 2>/dev/null)
-
-if [ -z "$SSHD_EFFECTIVE" ]; then
-    print_warn "sshd -T не работает — пропускаю проверку"
-else
-    PASSWORD_AUTH=$(echo "$SSHD_EFFECTIVE" | awk '/^passwordauthentication/ {print $2}')
-    PUBKEY_AUTH=$(echo "$SSHD_EFFECTIVE" | awk '/^pubkeyauthentication/ {print $2}')
-    KBD_INT_AUTH=$(echo "$SSHD_EFFECTIVE" | awk '/^kbdinteractiveauthentication/ {print $2}')
-
-    if [ "$PUBKEY_AUTH" = "yes" ]; then
-        print_ok "PubkeyAuthentication: yes"
-        SSHD_PUBKEY_AUTH_ENABLED=1
+# --- Проверка: fstab дубликаты (только warning, не правим) ---
+# v4.10: НЕ автодедупим. Если есть проблема — админ решит вручную.
+# Дубликаты в fstab вызывают warning при boot, но не ломают систему.
+if [ -f /etc/fstab ]; then
+    SWAP_COUNT=$(awk '!/^[[:space:]]*#/ && NF>=3 && $3=="swap"' /etc/fstab | wc -l)
+    if [ "$SWAP_COUNT" -gt 1 ]; then
+        print_warn "В /etc/fstab найдено $SWAP_COUNT swap-записей"
+        print_info "Это вызывает warning 'Duplicate entry' при boot (не критично)"
+        print_info "Чтобы убрать: вручную закомментируй лишние swap-строки в /etc/fstab"
     else
-        print_warn "PubkeyAuthentication: $PUBKEY_AUTH (отключено)"
-        print_info "Без него SSH-key auto-whitelist работать не будет"
-        SSHD_PUBKEY_AUTH_ENABLED=0
+        print_ok "fstab swap: 1 запись"
     fi
+fi
 
-    if [ "$PASSWORD_AUTH" = "yes" ] || [ "$KBD_INT_AUTH" = "yes" ]; then
-        print_warn "PasswordAuthentication=$PASSWORD_AUTH, KbdInteractive=$KBD_INT_AUTH"
-        print_info "Защита установится. Для МАКСИМАЛЬНОЙ безопасности:"
-        print_info "  1. Настрой вход по SSH-ключу"
-        print_info "  2. Отключи password-auth: см. инструкцию в конце скрипта"
-        SSHD_PASSWORD_AUTH_ENABLED=1
+# --- Финальное резюме ---
+echo ""
+print_info "Pre-flight завершён. v4.10 НЕ трогает netplan/cloud-init/network."
+print_info "Следующие шаги: установка XanMod + sysctl + NIC бусты."
+echo ""
+
+# ==============================================================================
+# ШАГ 2: ОЧИСТКА СИСТЕМЫ
+# ==============================================================================
+
+print_header "ШАГ 2: ОЧИСТКА СИСТЕМЫ"
+
+# v4.10: УДАЛЕНО полностью:
+#   - детект cloud-провайдера (dmidecode/cloud-init datasource/SSH-keys check)
+#   - cloud-init из списка purge (защита SSH-ключей)
+#   - snapd из списка purge (может косвенно зависеть cloud-init на Ubuntu Pro)
+# Удаляем ТОЛЬКО телеметрию и багрепортеры — они никак не влияют на сеть/SSH.
+
+# --- Бэкап существующих конфигов ---
+print_status "Создаём бэкап существующих конфигов..."
+# BACKUP_DIR уже создан в начале скрипта
+[ -f /etc/sysctl.conf ] && cp /etc/sysctl.conf "$BACKUP_DIR/" 2>/dev/null
+[ -d /etc/sysctl.d ] && cp -r /etc/sysctl.d "$BACKUP_DIR/" 2>/dev/null
+[ -d /etc/security/limits.d ] && cp -r /etc/security/limits.d "$BACKUP_DIR/" 2>/dev/null
+[ -d /etc/systemd/system.conf.d ] && cp -r /etc/systemd/system.conf.d "$BACKUP_DIR/" 2>/dev/null
+print_ok "Бэкап сохранён: $BACKUP_DIR"
+echo ""
+
+# --- Удаление ненужных пакетов (только телеметрия и багрепортеры) ---
+print_status "Удаляем ненужные пакеты (телеметрия)..."
+echo ""
+# v4.10: только безопасные удаления.
+# НЕ удаляем: snapd (Ubuntu Pro может зависеть), cloud-init (SSH ключи),
+# unattended-upgrades (security updates — отключаем как сервис ниже, но не покупаем).
+PKGS_TO_PURGE=("apport" "whoopsie" "ubuntu-report" "popularity-contest")
+
+for pkg in "${PKGS_TO_PURGE[@]}"; do
+    if dpkg -l "$pkg" &>/dev/null; then
+        apt-get purge -y "$pkg" 2>/dev/null || true
+        print_ok "Удалён: $pkg"
     else
-        print_ok "PasswordAuthentication: no — максимальная защита"
-        SSHD_PASSWORD_AUTH_ENABLED=0
-    fi
-fi
-
-# ==============================================================================
-# ШАГ 4: NFTABLES RATE-LIMIT
-# ==============================================================================
-
-print_header "ШАГ 4: NFTABLES RATE-LIMIT (kernel-level SYN flood protection)"
-
-NFT_CONF_DIR="/etc/nftables.d"
-NFT_DDOS_CONF="$NFT_CONF_DIR/ddos-protect.conf"
-mkdir -p "$NFT_CONF_DIR"
-
-cat > "$NFT_DDOS_CONF" <<EOF
-#!/usr/sbin/nft -f
-# Generated by vpn-node-ddos-protect.sh v1.4
-# Kernel-level SYN flood protection on Xray ports: $XRAY_PORTS
-# SSH port $SSH_PORT excluded from rate-limit.
-#
-# v1.4: rate-limit 60/sec burst 100 — даёт запас для CGNAT-юзеров мобильных
-# операторов, где сотни легитимных пользователей могут сидеть за одним IP.
-# Реальный SYN-flood делает тысячи SYN/sec — лимит 60 их режет, но
-# обычных юзеров не трогает.
-#
-# v1.3: scanner_blocklist drop'ает известных сканеров (Shodan, Censys,
-# госсканеры) ДО rate-limit. Они даже не доходят до handshake.
-# Списки обновляются каждые 6 часов через scanner-blocklist-update.timer.
-#
-# Whitelist в ЭТОЙ таблице — только runtime-добавленные IP (для ручного
-# исключения). Основной whitelist админа управляется CrowdSec'ом
-# через ssh-key auto-whitelist (см. /etc/crowdsec/postoverflows/...).
-#
-# Test:    hping3 -S -p ${XRAY_PORTS%%,*} -i u100 <YOUR_VPN_IP>
-# Monitor: nft list set inet ddos_protect syn_flood_v4
-#          nft list set inet ddos_protect scanner_blocklist_v4 | wc -l
-# Remove:  bash vpn-node-ddos-protect-v1_4.sh --uninstall
-
-# Идемпотентность
-table inet ddos_protect
-delete table inet ddos_protect
-
-table inet ddos_protect {
-    # --- Защищаемые порты (named sets, обновляются watcher'ом из фаервола) ---
-    # Заполняются скриптом /usr/local/sbin/update-protected-ports.sh из правил
-    # фаервола (UFW/firewalld/iptables). При изменении правил фаервола эти
-    # сеты обновляются автоматически в течение 30 секунд через systemd timer.
-    set protected_ports_tcp {
-        type inet_service
-        flags interval
-        auto-merge
-$XRAY_PORTS_TCP_INIT
-    }
-    set protected_ports_udp {
-        type inet_service
-        flags interval
-        auto-merge
-$XRAY_PORTS_UDP_INIT
-    }
-
-    # --- Pre-emptive blocklist (известные сканеры) ---
-    # Заполняется скриптом /usr/local/sbin/update-scanner-blocklist.sh
-    set scanner_blocklist_v4 {
-        type ipv4_addr
-        flags interval
-        auto-merge
-        # Размер для ~50k подсетей с запасом
-        size 131072
-    }
-    set scanner_blocklist_v6 {
-        type ipv6_addr
-        flags interval
-        auto-merge
-        size 131072
-    }
-
-    # --- Dynamic SYN-flood detection (TCP) ---
-    set syn_flood_v4 {
-        type ipv4_addr
-        flags dynamic, timeout
-        timeout 1m
-        size 65536
-    }
-    set syn_flood_v6 {
-        type ipv6_addr
-        flags dynamic, timeout
-        timeout 1m
-        size 65536
-    }
-
-    # --- Dynamic UDP-flood detection ---
-    set udp_flood_v4 {
-        type ipv4_addr
-        flags dynamic, timeout
-        timeout 1m
-        size 65536
-    }
-    set udp_flood_v6 {
-        type ipv6_addr
-        flags dynamic, timeout
-        timeout 1m
-        size 65536
-    }
-
-    # --- Manual whitelist ---
-    # Авто-заполняется management-IP из правил UFW "ALLOW from <IP>".
-    # Также можно добавить вручную:
-    #   nft add element inet ddos_protect manual_whitelist_v4 { 1.2.3.4 }
-    set manual_whitelist_v4 {
-        type ipv4_addr
-        flags interval
-        auto-merge
-$MANUAL_WHITELIST_V4_INIT
-    }
-    set manual_whitelist_v6 {
-        type ipv6_addr
-        flags interval
-        auto-merge
-$MANUAL_WHITELIST_V6_INIT
-    }
-
-    chain prerouting {
-        type filter hook prerouting priority -100; policy accept;
-
-        # Established/related — пропускаем без проверок.
-        ct state established,related accept
-
-        # Manual whitelist (всегда первым приоритетом)
-        ip  saddr @manual_whitelist_v4 accept
-        ip6 saddr @manual_whitelist_v6 accept
-
-        # SSH — без блокировок (защищает CrowdSec)
-        tcp dport $SSH_PORT accept
-
-        # Pre-emptive drop известных сканеров.
-        # Стоит ПЕРЕД rate-limit — экономит conntrack-слоты и CPU.
-        ip  saddr @scanner_blocklist_v4 drop
-        ip6 saddr @scanner_blocklist_v6 drop
-
-        # TCP SYN rate-limit на защищаемых портах: 60 SYN/sec, burst 100.
-        # Лимит подобран чтобы:
-        #   - Real SYN-flood (1000+/sec) — режется
-        #   - CGNAT мобильных операторов (100+ юзеров на IP) — проходит
-        #   - Обычный юзер делает 1-3 SYN/sec при подключении — не задевается
-        tcp dport @protected_ports_tcp ct state new meta nfproto ipv4 \\
-            add @syn_flood_v4 { ip saddr limit rate over 60/second burst 100 packets } drop
-        tcp dport @protected_ports_tcp ct state new meta nfproto ipv6 \\
-            add @syn_flood_v6 { ip6 saddr limit rate over 60/second burst 100 packets } drop
-
-        # UDP rate-limit на защищаемых портах: 200 packets/sec, burst 300.
-        # UDP-flood через Hysteria/TUIC/QUIC — типичная атака.
-        # Лимит выше TCP потому что UDP-протоколы шлют много мелких пакетов.
-        udp dport @protected_ports_udp meta nfproto ipv4 \\
-            add @udp_flood_v4 { ip saddr limit rate over 200/second burst 300 packets } drop
-        udp dport @protected_ports_udp meta nfproto ipv6 \\
-            add @udp_flood_v6 { ip6 saddr limit rate over 200/second burst 300 packets } drop
-    }
-}
-EOF
-
-# Загружаем правила
-if nft -f "$NFT_DDOS_CONF" 2>&1; then
-    print_ok "nft rate-limit активен"
-else
-    print_error "Ошибка загрузки nft-правил — смотри вывод выше"
-    exit 1
-fi
-
-# Подключаем в /etc/nftables.conf для автозагрузки при boot
-NFTABLES_MAIN="/etc/nftables.conf"
-if [ -f "$NFTABLES_MAIN" ] && ! grep -q "$NFT_DDOS_CONF" "$NFTABLES_MAIN"; then
-    cp -a "$NFTABLES_MAIN" "$BACKUP_DIR/nftables.conf.before"
-    echo "" >> "$NFTABLES_MAIN"
-    echo "# DDoS protection (vpn-node-ddos-protect)" >> "$NFTABLES_MAIN"
-    echo "include \"$NFT_DDOS_CONF\"" >> "$NFTABLES_MAIN"
-    print_ok "Подключено в $NFTABLES_MAIN (автозагрузка при boot)"
-fi
-
-systemctl enable nftables >/dev/null 2>&1 || true
-
-# ==============================================================================
-# ШАГ 5: PROTECTED PORTS WATCHER (auto-sync с фаерволом)
-# ==============================================================================
-
-print_header "ШАГ 5: PROTECTED PORTS WATCHER"
-
-# v1.7: автоматическая синхронизация защищаемых портов с правилами фаервола.
-# Каждые 30 секунд скрипт проверяет какие порты открыты в UFW/firewalld/iptables
-# и обновляет nft set @protected_ports_tcp/@protected_ports_udp.
-#
-# Преимущества:
-#   - Юзер открыл новый порт `ufw allow 12345` → защита подхватит за 30 сек
-#   - Закрыл порт → перестанет защищаться (логично — он больше не нужен)
-#   - Не зависит от того какой VPN-стек запущен и под каким именем процесса
-
-PORTS_UPDATER="/usr/local/sbin/update-protected-ports.sh"
-
-cat > "$PORTS_UPDATER" <<UPDATER_EOF
-#!/bin/bash
-# Sync nft sets @protected_ports_tcp/@protected_ports_udp с правилами фаервола.
-# Запускается через protected-ports-update.timer каждые 30 секунд.
-
-set -o pipefail
-
-LOG_TAG="protected-ports"
-FIREWALL_TYPE="$FIREWALL_TYPE"
-SSH_PORT="$SSH_PORT"
-
-# Если nft-таблицы нет — выходим
-if ! nft list table inet ddos_protect >/dev/null 2>&1; then
-    logger -t "\$LOG_TAG" "table inet ddos_protect не существует — пропускаю"
-    exit 0
-fi
-
-UPDATER_EOF
-
-# Дописываем функцию detect_firewall_ports в updater (та же что в шаге 2)
-# Делаем это через подстановку, чтобы юзер мог редактировать тип фаервола без перезапуска скрипта
-cat >> "$PORTS_UPDATER" <<'UPDATER_EOF2'
-detect_firewall_ports() {
-    local fw="$1"
-    local tcp_list=""
-    local udp_list=""
-    local mgmt_ipv4=""
-    local mgmt_ipv6=""
-
-    case "$fw" in
-        ufw)
-            local ufw_out
-            ufw_out=$(ufw status 2>/dev/null)
-            tcp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
-                    pp = $1
-                    if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
-                        n = split(pp, a, "/")
-                        port = a[1]
-                        proto = (n > 1) ? a[2] : "any"
-                        if (proto == "tcp" || proto == "any") print port
-                    }
-                }
-            ' | sort -un | tr '\n' ',' | sed 's/,$//')
-            udp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
-                    pp = $1
-                    if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
-                        n = split(pp, a, "/")
-                        port = a[1]
-                        proto = (n > 1) ? a[2] : "any"
-                        if (proto == "udp" || proto == "any") print port
-                    }
-                }
-            ' | sort -un | tr '\n' ',' | sed 's/,$//')
-            # v2.2: management IPs
-            mgmt_ipv4=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 != "Anywhere" {
-                    if ($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) print $3
-                }
-            ' | sort -u | tr '\n' ',' | sed 's/,$//')
-            mgmt_ipv6=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" {
-                    if ($3 ~ /:/ && $3 !~ /^Anywhere/) print $3
-                }
-            ' | sort -u | tr '\n' ',' | sed 's/,$//')
-            ;;
-        firewalld)
-            local fw_out
-            fw_out=$(firewall-cmd --list-ports 2>/dev/null)
-            tcp_list=$(echo "$fw_out" | tr ' ' '\n' | awk -F/ '$2=="tcp"{print $1}' | sort -un | tr '\n' ',' | sed 's/,$//')
-            udp_list=$(echo "$fw_out" | tr ' ' '\n' | awk -F/ '$2=="udp"{print $1}' | sort -un | tr '\n' ',' | sed 's/,$//')
-            # firewalld --list-rich-rules может содержать source address
-            local rich_rules
-            rich_rules=$(firewall-cmd --list-rich-rules 2>/dev/null)
-            mgmt_ipv4=$(echo "$rich_rules" | grep -oE 'address="[0-9.]+(/[0-9]+)?"' | \
-                grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u | tr '\n' ',' | sed 's/,$//')
-            ;;
-        iptables)
-            tcp_list=$(iptables -S INPUT 2>/dev/null | awk '/-j ACCEPT/ && /-p tcp/ {
-                for (i=1; i<=NF; i++) {
-                    if ($i == "--dport" || $i == "--dports") print $(i+1)
-                }
-            }' | tr ',' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
-            udp_list=$(iptables -S INPUT 2>/dev/null | awk '/-j ACCEPT/ && /-p udp/ {
-                for (i=1; i<=NF; i++) {
-                    if ($i == "--dport" || $i == "--dports") print $(i+1)
-                }
-            }' | tr ',' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
-            # iptables: -s <IP>/-s <IP/CIDR> в ACCEPT-правилах
-            mgmt_ipv4=$(iptables -S INPUT 2>/dev/null | awk '/-j ACCEPT/ {
-                for (i=1; i<=NF; i++) {
-                    if ($i == "-s") print $(i+1)
-                }
-            }' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' | \
-                grep -v '^0\.0\.0\.0' | sort -u | tr '\n' ',' | sed 's/,$//')
-            ;;
-        nftables)
-            local rules
-            rules=$(nft list ruleset 2>/dev/null | grep -E "(tcp|udp) dport" | grep "accept")
-            tcp_list=$(echo "$rules" | grep "tcp dport" | grep -oE 'dport [{0-9 ,}]+' | \
-                grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
-            udp_list=$(echo "$rules" | grep "udp dport" | grep -oE 'dport [{0-9 ,}]+' | \
-                grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
-            ;;
-    esac
-
-    echo "$tcp_list"
-    echo "$udp_list"
-    echo "$mgmt_ipv4"
-    echo "$mgmt_ipv6"
-}
-
-exclude_port() {
-    local list="$1" exclude="$2"
-    echo ",$list," | sed "s/,$exclude,/,/g; s/^,//; s/,$//"
-}
-
-# Получаем актуальные данные
-FW_OUTPUT=$(detect_firewall_ports "$FIREWALL_TYPE")
-NEW_TCP=$(echo "$FW_OUTPUT" | sed -n '1p')
-NEW_UDP=$(echo "$FW_OUTPUT" | sed -n '2p')
-NEW_MGMT_V4=$(echo "$FW_OUTPUT" | sed -n '3p')
-NEW_MGMT_V6=$(echo "$FW_OUTPUT" | sed -n '4p')
-
-# Исключаем SSH из TCP
-NEW_TCP=$(exclude_port "$NEW_TCP" "$SSH_PORT")
-
-# Текущее состояние nft set'ов
-CUR_TCP=$(nft list set inet ddos_protect protected_ports_tcp 2>/dev/null | \
-    tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
-CUR_UDP=$(nft list set inet ddos_protect protected_ports_udp 2>/dev/null | \
-    tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
-CUR_MGMT_V4=$(nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
-    tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | \
-    sort -u | tr '\n' ',' | sed 's/,$//')
-
-# v2.4: SAFETY GUARD — не затирать существующие данные пустыми результатами.
-# Это случается когда:
-#   - UFW в момент опроса делает atomic rename файлов (transient empty output)
-#   - path-unit срабатывает несколько раз подряд, и один раз фаервол не отвечает
-#   - Кратковременная блокировка ufw lock
-#
-# Логика: если фаервол активен И мы получили пустой результат, НО предыдущий
-# результат был непустой — это скорее всего transient ошибка. Пропускаем
-# обновление, не затираем правильные данные.
-FIREWALL_ACTIVE=0
-case "$FIREWALL_TYPE" in
-    ufw)       ufw status 2>/dev/null | grep -q "Status: active" && FIREWALL_ACTIVE=1 ;;
-    firewalld) systemctl is-active --quiet firewalld 2>/dev/null && FIREWALL_ACTIVE=1 ;;
-    iptables)  [ "$(iptables -L INPUT 2>/dev/null | wc -l)" -gt 2 ] && FIREWALL_ACTIVE=1 ;;
-    nftables)  nft list ruleset 2>/dev/null | grep -q "table inet filter" && FIREWALL_ACTIVE=1 ;;
-esac
-
-if [ "$FIREWALL_ACTIVE" = "1" ] && [ -z "$NEW_TCP" ] && [ -z "$NEW_UDP" ] && [ -z "$NEW_MGMT_V4" ]; then
-    if [ -n "$CUR_TCP" ] || [ -n "$CUR_MGMT_V4" ]; then
-        logger -t "$LOG_TAG" "SKIP: empty parse result while firewall is active (transient?)"
-        exit 0
-    fi
-fi
-
-# Если ничего не изменилось — выходим
-if [ "$NEW_TCP" = "$CUR_TCP" ] && [ "$NEW_UDP" = "$CUR_UDP" ] && [ "$NEW_MGMT_V4" = "$CUR_MGMT_V4" ]; then
-    exit 0
-fi
-
-# v2.4: Lock-файл — предотвращает одновременный запуск (path-unit + timer).
-# flock с -n (non-blocking) — если уже запущен другой instance, выходим.
-LOCKFILE="/run/cs-ssh-whitelist/.ports-update.lock"
-mkdir -p /run/cs-ssh-whitelist 2>/dev/null
-exec 200>"$LOCKFILE"
-if ! flock -n 200; then
-    logger -t "$LOG_TAG" "SKIP: another update already in progress"
-    exit 0
-fi
-
-# Атомарное обновление через nft -f
-TMP=$(mktemp)
-trap 'rm -f "$TMP"' EXIT
-
-{
-    echo "flush set inet ddos_protect protected_ports_tcp"
-    if [ -n "$NEW_TCP" ]; then
-        echo "add element inet ddos_protect protected_ports_tcp { $(echo "$NEW_TCP" | sed 's/,/, /g') }"
-    fi
-    echo "flush set inet ddos_protect protected_ports_udp"
-    if [ -n "$NEW_UDP" ]; then
-        echo "add element inet ddos_protect protected_ports_udp { $(echo "$NEW_UDP" | sed 's/,/, /g') }"
-    fi
-    # v2.2: синхронизируем management whitelist
-    echo "flush set inet ddos_protect manual_whitelist_v4"
-    if [ -n "$NEW_MGMT_V4" ]; then
-        echo "add element inet ddos_protect manual_whitelist_v4 { $(echo "$NEW_MGMT_V4" | sed 's/,/, /g') }"
-    fi
-    echo "flush set inet ddos_protect manual_whitelist_v6"
-    if [ -n "$NEW_MGMT_V6" ]; then
-        echo "add element inet ddos_protect manual_whitelist_v6 { $(echo "$NEW_MGMT_V6" | sed 's/,/, /g') }"
-    fi
-} > "$TMP"
-
-# v2.4: захватываем stderr из nft для диагностики (раньше >/dev/null глотал ошибки)
-NFT_ERR=$(nft -f "$TMP" 2>&1)
-if [ $? -eq 0 ]; then
-    logger -t "$LOG_TAG" "Updated: TCP={$NEW_TCP} UDP={$NEW_UDP} MGMT={$NEW_MGMT_V4}"
-else
-    logger -t "$LOG_TAG" "ERROR: nft failed: $NFT_ERR"
-    exit 1
-fi
-UPDATER_EOF2
-
-chmod 0755 "$PORTS_UPDATER"
-print_ok "Watcher script: $PORTS_UPDATER"
-
-# Systemd service + timer + path-unit
-cat > /etc/systemd/system/protected-ports-update.service <<EOF
-[Unit]
-Description=Sync nft protected_ports sets with firewall rules
-After=nftables.service network-online.target
-Wants=nftables.service
-# Не запускать многократно если несколько триггеров сработали одновременно
-StartLimitIntervalSec=10
-StartLimitBurst=5
-
-[Service]
-Type=oneshot
-ExecStart=$PORTS_UPDATER
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-EOF
-
-# v1.8: Timer как safety net каждые 60 секунд
-cat > /etc/systemd/system/protected-ports-update.timer <<'EOF'
-[Unit]
-Description=Sync protected ports every 60s (safety net for path-unit)
-Requires=protected-ports-update.service
-
-[Timer]
-OnBootSec=30s
-OnUnitActiveSec=60s
-AccuracySec=5s
-Persistent=false
-
-[Install]
-WantedBy=timers.target
-EOF
-
-# v1.8: Path-unit для МГНОВЕННОЙ реакции на изменения файлов фаервола.
-# Использует inotify через systemd для отслеживания изменений в:
-#   - UFW: /etc/ufw/user.rules, /etc/ufw/user6.rules
-#   - firewalld: /etc/firewalld/zones/, /etc/firewalld/direct.xml
-# При срабатывании любого PathChanged триггерит protected-ports-update.service.
-#
-# Преимущества vs только timer:
-#   - Реакция < 1 секунды (kernel-event, без поллинга)
-#   - Нулевая нагрузка (не опрашивает фаервол постоянно)
-#   - Timer остаётся как safety net (если кто-то меняет nft напрямую)
-PATH_UNIT_PATHS=""
-
-# UFW использует /etc/ufw/user*.rules (изменяются при ufw allow/deny)
-if [ -d /etc/ufw ]; then
-    [ -f /etc/ufw/user.rules ]  && PATH_UNIT_PATHS+="PathChanged=/etc/ufw/user.rules"$'\n'
-    [ -f /etc/ufw/user6.rules ] && PATH_UNIT_PATHS+="PathChanged=/etc/ufw/user6.rules"$'\n'
-fi
-
-# firewalld использует /etc/firewalld/zones/ (xml-файлы зон)
-if [ -d /etc/firewalld/zones ]; then
-    PATH_UNIT_PATHS+="PathModified=/etc/firewalld/zones"$'\n'
-fi
-
-# Если нашли что отслеживать — создаём path-unit
-if [ -n "$PATH_UNIT_PATHS" ]; then
-    cat > /etc/systemd/system/protected-ports-update.path <<EOF
-[Unit]
-Description=Watch firewall config files and trigger protected-ports-update
-After=nftables.service
-
-[Path]
-$PATH_UNIT_PATHS
-# Не дребезжать при нескольких изменениях за короткий период
-TriggerLimitIntervalSec=2
-TriggerLimitBurst=3
-Unit=protected-ports-update.service
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    HAS_PATH_UNIT=1
-    print_ok "Path-unit для inotify-watch создан"
-else
-    HAS_PATH_UNIT=0
-    print_info "Path-unit пропущен (файлы фаервола не найдены — только timer)"
-fi
-
-systemctl daemon-reload
-systemctl enable --now protected-ports-update.timer >/dev/null 2>&1
-
-if [ "$HAS_PATH_UNIT" = "1" ]; then
-    systemctl enable --now protected-ports-update.path >/dev/null 2>&1
-    print_ok "Auto-sync активен: path-unit (мгновенно) + timer (60с safety net)"
-else
-    print_ok "Timer активен (синхронизация каждые 60 секунд)"
-fi
-
-# ==============================================================================
-# ШАГ 6: SCANNER-BLOCKLIST UPDATER (pre-emptive drop)
-# ==============================================================================
-
-print_header "ШАГ 6: SCANNER-BLOCKLIST UPDATER"
-
-# v1.3: качаем подсети известных сканеров (Shodan, Censys, BinaryEdge,
-# госсканеры РФ/CN/etc) и кладём их в nft set scanner_blocklist_v4/v6.
-# Источник: https://github.com/shadow-netlab/traffic-guard-lists
-#
-# Обновляется раз в 6 часов через systemd timer.
-# Атомарный обмен через одну nft-транзакцию (flush + add) — split-brain
-# состояния невозможно.
-
-UPDATER_SCRIPT="/usr/local/sbin/update-scanner-blocklist.sh"
-
-cat > "$UPDATER_SCRIPT" <<'UPDATER_EOF'
-#!/bin/bash
-# Обновляет nft set inet ddos_protect scanner_blocklist_v4/v6
-# из публичных списков подсетей сканеров.
-# Запускается через scanner-blocklist-update.timer.
-
-set -o pipefail
-
-LISTS=(
-    "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list"
-    "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list"
-)
-
-LOG_TAG="scanner-blocklist"
-
-# Если nft-таблицы нет — выходим (скрипт может стартануть до первой установки)
-if ! nft list table inet ddos_protect >/dev/null 2>&1; then
-    logger -t "$LOG_TAG" "table inet ddos_protect не существует — пропускаю"
-    exit 0
-fi
-
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-
-# Качаем все списки в один файл
-for url in "${LISTS[@]}"; do
-    if curl -fsSL --max-time 30 --retry 2 "$url" -o "$TMP/dl.tmp" 2>/dev/null; then
-        cat "$TMP/dl.tmp" >> "$TMP/all.raw"
-    else
-        logger -t "$LOG_TAG" "WARN: не смог скачать $url"
+        print_info "Не установлен: $pkg"
     fi
 done
+apt-get autoremove -y 2>/dev/null || true
+echo ""
+print_ok "Очистка завершена"
+print_info "cloud-init и snapd НЕ удаляются (защита от поломки SSH-доступа)"
 
-if [ ! -s "$TMP/all.raw" ]; then
-    logger -t "$LOG_TAG" "ERROR: пустой результат скачивания, не обновляю set"
-    exit 1
-fi
+# --- Отключение ненужных сервисов ---
+# Это только disable, пакеты остаются. При необходимости легко включить обратно.
+print_status "Отключаем ненужные сервисы..."
 
-# Извлекаем валидные IPv4-подсети (с CIDR или без)
-grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' "$TMP/all.raw" | \
-    sort -u > "$TMP/v4.list"
+SERVICES_TO_DISABLE=(
+    "ModemManager"
+    "fwupd"
+    "udisks2"
+    "multipathd"
+    "unattended-upgrades"
+)
 
-# IPv6: строки содержащие ':' и валидные hex
-grep ':' "$TMP/all.raw" | \
-    grep -oE '^[0-9a-fA-F:]+(/[0-9]+)?' | \
-    grep -E '[0-9a-fA-F]{1,4}:[0-9a-fA-F:]*' | \
-    sort -u > "$TMP/v6.list"
-
-V4_COUNT=$(wc -l < "$TMP/v4.list")
-V6_COUNT=$(wc -l < "$TMP/v6.list")
-
-# Sanity: если в списке слишком мало — что-то сломалось, не применяем
-if [ "$V4_COUNT" -lt 10 ]; then
-    logger -t "$LOG_TAG" "ERROR: только $V4_COUNT IPv4 подсетей — выглядит сломанным, не применяю"
-    exit 1
-fi
-
-# Атомарный обмен: всё в одной nft-транзакции
-{
-    echo "flush set inet ddos_protect scanner_blocklist_v4"
-    if [ -s "$TMP/v4.list" ]; then
-        # Группами по 1000 элементов на add (производительнее чем по одному)
-        awk 'NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet ddos_protect scanner_blocklist_v4 { " } { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 } END { print " }" }' "$TMP/v4.list"
+for svc in "${SERVICES_TO_DISABLE[@]}"; do
+    if systemctl is-enabled "$svc" &>/dev/null; then
+        systemctl disable --now "$svc" 2>/dev/null || true
+        print_ok "Отключён: $svc"
+    else
+        print_info "Уже отключён или не найден: $svc"
     fi
-    echo "flush set inet ddos_protect scanner_blocklist_v6"
-    if [ -s "$TMP/v6.list" ]; then
-        awk 'NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet ddos_protect scanner_blocklist_v6 { " } { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 } END { print " }" }' "$TMP/v6.list"
-    fi
-} > "$TMP/nft-batch"
+done
+echo ""
 
-if nft -f "$TMP/nft-batch" 2>"$TMP/nft.err"; then
-    logger -t "$LOG_TAG" "Updated: $V4_COUNT IPv4, $V6_COUNT IPv6 подсетей"
-    exit 0
+# --- Ограничение journald ---
+print_status "Ограничиваем размер логов journald..."
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/size-limit.conf <<EOF
+[Journal]
+SystemMaxUse=100M
+RuntimeMaxUse=50M
+EOF
+systemctl reload systemd-journald 2>/dev/null || systemctl restart systemd-journald 2>/dev/null || true
+print_ok "Journald ограничен: SystemMaxUse=100M"
+
+# ==============================================================================
+# ШАГ 3: АНАЛИЗ CPU
+# ==============================================================================
+
+print_header "ШАГ 3: АНАЛИЗ ПРОЦЕССОРА"
+
+print_status "Читаем информацию о CPU..."
+
+CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo | cut -d':' -f2 | xargs)
+CPU_CORES=$(nproc)
+echo -e "    ├─ Модель: ${GREEN}$CPU_MODEL${NC}"
+echo -e "    └─ Ядер: ${GREEN}$CPU_CORES${NC}"
+echo ""
+
+print_status "Определяем уровень CPU (x86-64-v?)..."
+
+CPU_FLAGS=$(grep -m1 '^flags' /proc/cpuinfo)
+
+# XanMod не выпускает v4 пакеты — максимум v3
+if echo "$CPU_FLAGS" | grep -q 'avx512'; then
+    CPU_LEVEL=3
+    LEVEL_DESC="AVX-512 → используем v3 (v4 пакетов нет)"
+elif echo "$CPU_FLAGS" | grep -q 'avx2'; then
+    CPU_LEVEL=3
+    LEVEL_DESC="AVX2 (Современный)"
+elif echo "$CPU_FLAGS" | grep -q 'sse4_2'; then
+    CPU_LEVEL=2
+    LEVEL_DESC="SSE4.2 (Базовый)"
 else
-    logger -t "$LOG_TAG" "ERROR: nft -f failed: $(cat "$TMP/nft.err")"
+    CPU_LEVEL=2
+    LEVEL_DESC="Базовый x86-64 → используем v2"
+fi
+
+echo ""
+echo -e "    ${BOLD}Результат анализа:${NC}"
+echo -e "    ├─ Уровень: ${GREEN}x86-64-v${CPU_LEVEL}${NC}"
+echo -e "    └─ Описание: ${GREEN}$LEVEL_DESC${NC}"
+echo ""
+
+print_info "Ключевые флаги CPU:"
+echo -n "    "
+for flag in sse4_2 avx avx2 avx512f aes; do
+    if echo "$CPU_FLAGS" | grep -q "$flag"; then
+        echo -ne "${GREEN}[$flag]${NC} "
+    else
+        echo -ne "${RED}[$flag]${NC} "
+    fi
+done
+echo ""
+
+print_ok "CPU Level определён: x86-64-v${CPU_LEVEL}"
+
+# ==============================================================================
+# ШАГ 4: УСТАНОВКА XANMOD
+# ==============================================================================
+
+print_header "ШАГ 4: УСТАНОВКА ЯДРА XANMOD"
+
+# Удаляем старые ключи
+print_status "Очищаем старые ключи XanMod (если есть)..."
+rm -f /usr/share/keyrings/xanmod-archive-keyring.gpg 2>/dev/null
+rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null
+print_ok "Старые ключи удалены"
+
+# Обновляем систему
+print_status "Обновляем списки пакетов..."
+echo ""
+if ! apt-get update; then
+    print_error "FATAL: apt-get update завершился с ошибкой!"
+    print_info "Проверьте интернет-соединение и состояние репозиториев (/etc/apt/sources.list)"
     exit 1
 fi
-UPDATER_EOF
+echo ""
+print_ok "Списки обновлены"
 
-chmod 0755 "$UPDATER_SCRIPT"
-print_ok "Updater script: $UPDATER_SCRIPT"
+# Устанавливаем зависимости
+print_status "Устанавливаем необходимые пакеты..."
+echo ""
+apt-get install -y wget gnupg2 ca-certificates lsb-release bc
+echo ""
+print_ok "Зависимости установлены"
 
-# Systemd service + timer
-cat > /etc/systemd/system/scanner-blocklist-update.service <<EOF
+# Добавляем репозиторий XanMod
+print_status "Добавляем репозиторий XanMod..."
+mkdir -p /etc/apt/keyrings
+echo -e "    Скачиваем GPG ключ..."
+XANMOD_KEY_TMP=$(mktemp)
+if ! wget -qO "$XANMOD_KEY_TMP" https://dl.xanmod.org/archive.key; then
+    print_error "Не удалось скачать GPG ключ XanMod! Проверьте интернет-соединение."
+    rm -f "$XANMOD_KEY_TMP"
+    exit 1
+fi
+
+gpg --dearmor < "$XANMOD_KEY_TMP" > /etc/apt/keyrings/xanmod-archive-keyring.gpg
+rm -f "$XANMOD_KEY_TMP"
+echo ""
+print_ok "GPG ключ добавлен"
+
+DISTRO_CODENAME=$(lsb_release -sc)
+echo -e "    Codename дистрибутива: ${GREEN}$DISTRO_CODENAME${NC}"
+
+echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${DISTRO_CODENAME} main" | tee /etc/apt/sources.list.d/xanmod-release.list
+print_ok "Репозиторий добавлен в sources.list"
+
+print_status "Обновляем списки пакетов (с XanMod)..."
+echo ""
+if ! apt-get update; then
+    print_error "FATAL: apt-get update с репозиторием XanMod провалился!"
+    print_info "Возможные причины:"
+    print_info "  - Репозиторий XanMod недоступен (deb.xanmod.org)"
+    print_info "  - GPG ключ не подходит к репозиторию"
+    print_info "  - Codename '$DISTRO_CODENAME' не поддерживается XanMod"
+    print_info "Удалите файл /etc/apt/sources.list.d/xanmod-release.list и повторите."
+    exit 1
+fi
+echo ""
+print_ok "Списки обновлены"
+
+# Устанавливаем ядро
+KERNEL_PKG="linux-xanmod-x64v${CPU_LEVEL}"
+print_status "Проверяем доступность пакета: ${BOLD}${KERNEL_PKG}${NC}"
+
+if ! apt-cache show "$KERNEL_PKG" >/dev/null 2>&1; then
+    print_error "Пакет $KERNEL_PKG не найден!"
+
+    if [ "$CPU_LEVEL" -eq 3 ]; then
+        KERNEL_PKG="linux-xanmod-x64v2"
+        print_info "Пробуем fallback: $KERNEL_PKG"
+
+        if ! apt-cache show "$KERNEL_PKG" >/dev/null 2>&1; then
+            print_error "Пакет $KERNEL_PKG тоже не найден!"
+            echo ""
+            print_info "Доступные пакеты XanMod:"
+            apt-cache search linux-xanmod | head -20
+            exit 1
+        fi
+    else
+        echo ""
+        print_info "Доступные пакеты XanMod:"
+        apt-cache search linux-xanmod | head -20
+        exit 1
+    fi
+fi
+
+print_ok "Пакет найден: $KERNEL_PKG"
+echo ""
+
+print_status "Устанавливаем ядро: ${BOLD}${KERNEL_PKG}${NC}"
+echo ""
+
+# Проверка свободного места (нужно ~500MB на ядро)
+FREE_BOOT=$(df -m /boot 2>/dev/null | awk 'NR==2 {print $4}')
+FREE_ROOT=$(df -m / | awk 'NR==2 {print $4}')
+echo -e "    Свободно на /boot: ${GREEN}${FREE_BOOT:-N/A} MB${NC}"
+echo -e "    Свободно на /:     ${GREEN}${FREE_ROOT} MB${NC}"
+
+if [ -n "$FREE_BOOT" ] && [ "$FREE_BOOT" -lt 200 ]; then
+    print_error "На /boot меньше 200MB! Установка ядра может не пройти."
+    print_info "Очистите старые ядра: apt autoremove --purge"
+    exit 1
+fi
+if [ "$FREE_ROOT" -lt 1500 ]; then
+    print_error "На / меньше 1.5GB! Установка ядра может не пройти."
+    exit 1
+fi
+print_ok "Свободного места достаточно"
+
+# Сохраняем имя текущего ядра как fallback
+CURRENT_KERNEL=$(uname -r)
+echo -e "    Текущее ядро (fallback): ${GREEN}$CURRENT_KERNEL${NC}"
+echo ""
+echo -e "${YELLOW}═══════════════════════════════════════════════════════════════════${NC}"
+DEBIAN_FRONTEND=noninteractive apt-get install -y "$KERNEL_PKG"
+INSTALL_RESULT=$?
+echo -e "${YELLOW}═══════════════════════════════════════════════════════════════════${NC}"
+echo ""
+
+if [ $INSTALL_RESULT -eq 0 ]; then
+    print_ok "Ядро XanMod успешно установлено!"
+
+    # ==========================================================================
+    # POST-INSTALL VALIDATION — проверки ДО update-grub
+    # Если новое ядро битое — лучше узнать сейчас чем после ребута
+    # ==========================================================================
+
+    # Определяем версию свежеустановленного ядра
+    NEW_KERNEL_VERSION=$(ls /boot/vmlinuz-*xanmod* 2>/dev/null | xargs -I{} basename {} | sed 's/^vmlinuz-//' | sort -V | tail -1)
+
+    if [ -n "$NEW_KERNEL_VERSION" ] && [ "$NEW_KERNEL_VERSION" != "$CURRENT_KERNEL" ]; then
+        print_status "Валидация нового ядра: $NEW_KERNEL_VERSION"
+
+        # --- Защита 1: initramfs существует и не битый ---
+        # Если установка ядра прерывалась, initrd может быть пустой / маленький
+        # Здоровый initrd обычно >40MB, но мы проверяем хотя бы >10MB
+        NEW_INITRD="/boot/initrd.img-${NEW_KERNEL_VERSION}"
+        if [ -f "$NEW_INITRD" ]; then
+            INITRD_SIZE=$(stat -c%s "$NEW_INITRD" 2>/dev/null)
+            INITRD_SIZE_MB=$((INITRD_SIZE / 1048576))
+            if [ "$INITRD_SIZE_MB" -lt 10 ]; then
+                print_warn "initramfs подозрительно маленький: ${INITRD_SIZE_MB}MB (ожидалось >40MB)"
+                print_status "Пересобираем initramfs..."
+                if update-initramfs -u -k "$NEW_KERNEL_VERSION" 2>&1 | tail -5; then
+                    INITRD_SIZE=$(stat -c%s "$NEW_INITRD" 2>/dev/null)
+                    INITRD_SIZE_MB=$((INITRD_SIZE / 1048576))
+                    if [ "$INITRD_SIZE_MB" -lt 10 ]; then
+                        print_error "initramfs всё ещё битый — НЕ РЕБУТАЙТЕ"
+                        print_info "Это критическая ошибка установки ядра"
+                        exit 1
+                    fi
+                    print_ok "initramfs пересобран: ${INITRD_SIZE_MB}MB"
+                fi
+            else
+                print_ok "initramfs корректный: ${INITRD_SIZE_MB}MB"
+            fi
+        else
+            print_error "initramfs не найден: $NEW_INITRD"
+            print_error "Это критическая ошибка установки ядра — НЕ РЕБУТАЙТЕ"
+            exit 1
+        fi
+
+        # --- Защита 2: /lib/modules целостность ---
+        # Если modules.dep битый или отсутствует — depmod не отработал
+        MODULES_DIR="/lib/modules/$NEW_KERNEL_VERSION"
+        if [ -d "$MODULES_DIR" ]; then
+            if [ ! -s "$MODULES_DIR/modules.dep" ]; then
+                print_warn "modules.dep отсутствует или пустой — запускаем depmod..."
+                if depmod -a "$NEW_KERNEL_VERSION" 2>&1; then
+                    print_ok "modules.dep пересоздан"
+                else
+                    print_error "depmod не сработал — модули могут не загрузиться"
+                fi
+            else
+                print_ok "Модули ядра целостны"
+            fi
+        else
+            print_error "Директория модулей $MODULES_DIR не существует"
+            print_error "Установка ядра прошла неполно — НЕ РЕБУТАЙТЕ"
+            exit 1
+        fi
+
+        # --- Защита 3: Драйвер сетевой карты есть в новом ядре ---
+        # Самая критичная проверка: если в новом ядре нет драйвера NIC,
+        # после ребута сеть будет мертва и потребуется hard reset через console
+        if [ -n "$DEFAULT_IFACE" ] && command -v ethtool >/dev/null 2>&1; then
+            NIC_DRIVER=$(ethtool -i "$DEFAULT_IFACE" 2>/dev/null | awk '/^driver:/{print $2; exit}')
+            if [ -n "$NIC_DRIVER" ]; then
+                print_status "Проверяем драйвер NIC ($NIC_DRIVER) в новом ядре..."
+                # Ищем .ko или .ko.* (.ko.zst, .ko.xz) в директории модулей
+                DRIVER_FOUND=$(find "$MODULES_DIR" -name "${NIC_DRIVER}.ko*" 2>/dev/null | head -1)
+
+                if [ -n "$DRIVER_FOUND" ]; then
+                    print_ok "Драйвер $NIC_DRIVER найден в новом ядре"
+                else
+                    # Может быть встроен в само ядро (builtin)
+                    BUILTIN=$(grep -q "^${NIC_DRIVER}$\|/${NIC_DRIVER}\.ko$" "$MODULES_DIR/modules.builtin" 2>/dev/null && echo "yes")
+                    if [ "$BUILTIN" = "yes" ]; then
+                        print_ok "Драйвер $NIC_DRIVER встроен в ядро"
+                    else
+                        print_error "ВНИМАНИЕ: Драйвер $NIC_DRIVER НЕ НАЙДЕН в новом ядре!"
+                        print_error "После ребута сеть НЕ ПОДНИМЕТСЯ — потребуется hard reset"
+                        echo ""
+                        print_info "Варианты действий:"
+                        print_info "  1. Отменить ребут, оставить старое ядро как default:"
+                        print_info "     sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=\"1>0\"/' /etc/default/grub"
+                        print_info "     update-grub"
+                        print_info "  2. Удалить новое ядро: apt-get remove $KERNEL_PKG"
+                        echo ""
+                        read -p "Продолжить установку? (НЕ рекомендуется) (y/N): " -n 1 -r < /dev/tty
+                        echo ""
+                        [[ ! $REPLY =~ ^[Yy]$ ]] && {
+                            print_info "Установка прервана. Старое ядро не тронуто."
+                            exit 1
+                        }
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # Гарантируем что текущее (рабочее) ядро останется в GRUB как запасное
+    print_status "Проверяем загрузчик и настраиваем fallback..."
+    # Проверяем что используется GRUB, а не systemd-boot (Ubuntu 24.04+)
+    if [ -f /etc/default/grub ] && (dpkg -l grub-pc &>/dev/null || dpkg -l grub-efi-amd64 &>/dev/null); then
+        if ! grep -q "GRUB_DISABLE_SUBMENU" /etc/default/grub; then
+            echo 'GRUB_DISABLE_SUBMENU=y' >> /etc/default/grub
+            print_ok "GRUB submenu отключён (старое ядро доступно в меню)"
+        fi
+        if update-grub 2>/dev/null; then
+            print_ok "GRUB обновлён"
+        else
+            print_info "update-grub вернул ошибку — проверьте GRUB вручную после ребута"
+        fi
+    elif { [ -d /boot/efi/EFI/systemd ] || [ -f /boot/efi/EFI/ubuntu/grubx64.efi ]; } && ! dpkg -l grub-pc &>/dev/null; then
+        print_info "Обнаружен systemd-boot — GRUB конфиг не трогаем, ядро выбирается автоматически"
+    else
+        print_info "GRUB не найден или не управляет загрузкой — пропускаем"
+    fi
+else
+    print_error "Ошибка установки ядра! Код: $INSTALL_RESULT"
+    print_info "Текущее ядро не тронуто. Сервер загрузится как обычно."
+    exit 1
+fi
+
+# ==============================================================================
+# ШАГ 5: ОТКЛЮЧЕНИЕ IPv6
+# ==============================================================================
+
+print_header "ШАГ 5: ОТКЛЮЧЕНИЕ IPv6 (через sysctl, безопасный метод)"
+
+# v4.10: УДАЛЁН метод через GRUB cmdline (ipv6.disable=1) — он трогает boot.
+# Оставлен только sysctl-метод: безопасный, применяется runtime, не требует ребута.
+#
+# Что меняется:
+#   - GRUB cmdline НЕ правится (boot не трогаем)
+#   - update-grub НЕ вызывается
+#   - модуль ipv6 ОСТАЁТСЯ загружен в памяти (~5-10 MB RAM)
+#   - но IPv6 трафик не работает: bind(AF_INET6) возвращает EADDRNOTAVAIL,
+#     AAAA-resolves не дают результата
+#
+# Эффект: те же 99% функционального отключения IPv6, без риска поломки boot.
+
+print_status "Создаём sysctl-конфиг для отключения IPv6..."
+mkdir -p /etc/sysctl.d
+cat > /etc/sysctl.d/99-disable-ipv6.conf <<EOF
+# IPv6 disabled via sysctl (safe method — does not touch GRUB)
+# Module ipv6 remains loaded but all IPv6 traffic is rejected.
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+print_ok "sysctl-конфиг создан: /etc/sysctl.d/99-disable-ipv6.conf"
+
+# Применяем сразу (без ребута)
+print_status "Применяем настройки..."
+if sysctl -p /etc/sysctl.d/99-disable-ipv6.conf >/dev/null 2>&1; then
+    print_ok "IPv6 отключён в runtime"
+else
+    print_warn "sysctl -p вернул ошибку — настройки применятся при следующем ребуте"
+fi
+
+# === Force IPv4 priority в gai.conf ===
+# Чтобы getaddrinfo() возвращал IPv4 первым, даже если AAAA-запись существует
+if [ -f /etc/gai.conf ]; then
+    if ! grep -qE '^precedence ::ffff:0:0/96' /etc/gai.conf; then
+        print_status "Настраиваем приоритет IPv4 в /etc/gai.conf..."
+        echo "" >> /etc/gai.conf
+        echo "# Force IPv4 over IPv6 for getaddrinfo()" >> /etc/gai.conf
+        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+        print_ok "IPv4 приоритет в gai.conf установлен"
+    else
+        print_info "IPv4 приоритет в gai.conf уже настроен"
+    fi
+fi
+
+print_ok "IPv6 отключён через sysctl (модуль остаётся в памяти, но трафик не работает)"
+print_info "Если хочешь полностью выгрузить модуль — добавь ipv6.disable=1 в GRUB вручную:"
+print_info "  sed -i 's|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"ipv6.disable=1 |' /etc/default/grub"
+print_info "  update-grub  # затем reboot"
+
+# ==============================================================================
+# ШАГ 6: НАСТРОЙКА CONNTRACK
+# ==============================================================================
+
+print_header "ШАГ 6: НАСТРОЙКА CONNTRACK"
+
+print_status "Загружаем модуль nf_conntrack..."
+modprobe nf_conntrack 2>/dev/null || true
+
+# Применяем сразу (до перезагрузки)
+print_status "Применяем настройки conntrack..."
+sysctl -w net.netfilter.nf_conntrack_max=262144 2>/dev/null || true
+sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=7200 2>/dev/null || true
+sysctl -w net.netfilter.nf_conntrack_tcp_timeout_time_wait=60 2>/dev/null || true
+sysctl -w net.netfilter.nf_conntrack_tcp_timeout_close_wait=60 2>/dev/null || true
+sysctl -w net.netfilter.nf_conntrack_udp_timeout=120 2>/dev/null || true
+sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=180 2>/dev/null || true
+sysctl -w net.netfilter.nf_conntrack_generic_timeout=300 2>/dev/null || true
+
+# Hashsize = conntrack_max / 4
+# Применяем мягко: только если модуль свежезагружен или активных соединений мало
+if [ -f /sys/module/nf_conntrack/parameters/hashsize ]; then
+    CURRENT_HASHSIZE=$(cat /sys/module/nf_conntrack/parameters/hashsize)
+    ACTIVE_CONN=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
+
+    if [ "$CURRENT_HASHSIZE" = "65536" ]; then
+        print_info "Hashsize уже 65536 — пропускаем"
+    elif [ "$ACTIVE_CONN" -lt 5000 ]; then
+        # Безопасно менять — мало активных коннектов
+        echo 65536 > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null && \
+            print_ok "Hashsize изменён: $CURRENT_HASHSIZE → 65536 (активных соед.: $ACTIVE_CONN)" || \
+            print_info "Hashsize применится после ребута (через modprobe.d)"
+    else
+        # Много активного трафика — не трогаем сейчас, применится после ребута
+        print_info "Активных соед.: $ACTIVE_CONN — hashsize применится после ребута (избегаем лагов)"
+    fi
+fi
+
+# Сохраняем в конфиг для сохранения после ребута
+cat > /etc/sysctl.d/99-conntrack.conf <<EOF
+# Conntrack tuning for VPN node (gaming-friendly)
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 60
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
+net.netfilter.nf_conntrack_udp_timeout = 120
+net.netfilter.nf_conntrack_udp_timeout_stream = 180
+net.netfilter.nf_conntrack_generic_timeout = 300
+EOF
+print_ok "Conntrack настроен и сохранён"
+
+# Hashsize через modprobe для сохранения после ребута
+cat > /etc/modprobe.d/conntrack.conf <<EOF
+options nf_conntrack hashsize=65536
+EOF
+print_ok "Hashsize сохранён в modprobe.d"
+
+# Гарантируем загрузку модуля при boot (на минималистичных образах его может не быть)
+mkdir -p /etc/modules-load.d
+cat > /etc/modules-load.d/conntrack.conf <<EOF
+# Force-load conntrack at boot (needed for nf_conntrack_max sysctl to take effect)
+nf_conntrack
+EOF
+print_ok "nf_conntrack будет автозагружаться при boot"
+
+# ==============================================================================
+# ШАГ 7: НАСТРОЙКА СЕТЕВОГО СТЕКА (SYSCTL)
+# ==============================================================================
+
+print_header "ШАГ 7: НАСТРОЙКА СЕТЕВОГО СТЕКА (SYSCTL)"
+
+# Получаем информацию о памяти
+TOTAL_MEM_MB=$(free -m | awk '/^Mem:/{print $2}')
+TOTAL_MEM_GB=$(echo "scale=1; $TOTAL_MEM_MB / 1024" | bc)
+USED_MEM_MB=$(free -m | awk '/^Mem:/{print $3}')
+FREE_MEM_MB=$(free -m | awk '/^Mem:/{print $4}')
+
+print_status "Анализируем оперативную память..."
+echo ""
+echo -e "    ${BOLD}Память:${NC}"
+echo -e "    ├─ Всего: ${GREEN}${TOTAL_MEM_MB} MB${NC} (~${TOTAL_MEM_GB} GB)"
+echo -e "    ├─ Использовано: ${YELLOW}${USED_MEM_MB} MB${NC}"
+echo -e "    └─ Свободно: ${GREEN}${FREE_MEM_MB} MB${NC}"
+echo ""
+
+SYSCTL_FILE="/etc/sysctl.d/99-xray-tuning.conf"
+
+# Определяем профиль
+if [ "$TOTAL_MEM_MB" -le 1200 ]; then
+    PROFILE_NAME="SURVIVAL MODE"
+    PROFILE_COLOR="${RED}"
+    PROFILE_EMOJI="🔴"
+elif [ "$TOTAL_MEM_MB" -le 2500 ]; then
+    PROFILE_NAME="BALANCED MODE"
+    PROFILE_COLOR="${YELLOW}"
+    PROFILE_EMOJI="🟡"
+elif [ "$TOTAL_MEM_MB" -le 8500 ]; then
+    PROFILE_NAME="PERFORMANCE MODE"
+    PROFILE_COLOR="${GREEN}"
+    PROFILE_EMOJI="🟢"
+else
+    PROFILE_NAME="ULTRA 10G MODE"
+    PROFILE_COLOR="${MAGENTA}"
+    PROFILE_EMOJI="🟣"
+fi
+
+echo -e "    ${BOLD}Выбранный профиль:${NC}"
+echo -e "    ${PROFILE_COLOR}╔═══════════════════════════════════════╗${NC}"
+echo -e "    ${PROFILE_COLOR}║  ${PROFILE_EMOJI} ${PROFILE_NAME}${NC}"
+echo -e "    ${PROFILE_COLOR}╚═══════════════════════════════════════╝${NC}"
+echo ""
+
+print_status "Генерируем конфигурацию sysctl..."
+
+# --- Базовый конфиг (общий для всех профилей) ---
+cat > $SYSCTL_FILE <<EOF
+# ==============================================================================
+# XRAY/VPN NODE OPTIMIZATION v4.0 - AUTO-GENERATED
+# Profile: $PROFILE_NAME
+# RAM: ${TOTAL_MEM_MB} MB
+# Generated: $(date)
+# ==============================================================================
+
+# === BBRv3 Congestion Control ===
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# === IP Forwarding ===
+net.ipv4.ip_forward = 1
+
+# === TCP Connections ===
+# Очередь входящих соединений (accept backlog)
+net.core.somaxconn = 65535
+# Очередь SYN-пакетов (защита от SYN flood + пики подключений)
+net.ipv4.tcp_max_syn_backlog = 65535
+# SYN cookies при переполнении очереди
+net.ipv4.tcp_syncookies = 1
+# Переиспользование TIME_WAIT сокетов (критично при тысячах коннекций)
+net.ipv4.tcp_tw_reuse = 1
+# Быстрое освобождение FIN_WAIT сокетов (30 — баланс между играми и ресурсами)
+net.ipv4.tcp_fin_timeout = 30
+# Расширенный диапазон эфемерных портов
+net.ipv4.ip_local_port_range = 1024 65535
+# Не сбрасывать cwnd после паузы (ускоряет VPN-туннели)
+net.ipv4.tcp_slow_start_after_idle = 0
+# Автоматическое определение MTU (избежание фрагментации в туннелях)
+net.ipv4.tcp_mtu_probing = 1
+# Защита от TIME_WAIT assassination (RFC 1337)
+net.ipv4.tcp_rfc1337 = 1
+# TCP Fast Open отключён: конфликтует с Xray Reality TLS handshake
+# Если используете не-Reality протоколы — раскомментируйте:
+# net.ipv4.tcp_fastopen = 3
+# Timestamps обязательны для безопасности tcp_tw_reuse (RFC 1323)
+net.ipv4.tcp_timestamps = 1
+
+# === Connection Keepalives (Mobile clients) ===
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 15
+
+# === Bufferbloat reduction (latency boost для клиента) ===
+# Ограничивает очередь на отправке, режет p99 latency на 15-40ms под нагрузкой
+# Критично для видеозвонков, игр, SSH через VPN
+net.ipv4.tcp_notsent_lowat = 131072
+
+# === Security Hardening ===
+# Loose reverse path filtering (compatible with VPN tunnels)
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+# Не отправляем ICMP redirects
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+# Не принимаем ICMP redirects
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+# Игнорируем broadcast ICMP
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+# === File Descriptors (ядро, system-wide) ===
+fs.file-max = 2097152
+
+# === Inotify Limits (важно при 10k+ соединений Xray) ===
+# Дефолты Linux (8192/128) не справляются с большим числом сокетов/файлов
+fs.inotify.max_user_watches = 524288
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_queued_events = 65536
+EOF
+
+# --- Профильные настройки (зависят от RAM) ---
+if [ "$TOTAL_MEM_MB" -le 1200 ]; then
+    cat >> $SYSCTL_FILE <<EOF
+
+# === TIER 1: 1GB RAM (SURVIVAL MODE) ===
+net.core.rmem_max = 2097152
+net.core.wmem_max = 2097152
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 87380 2097152
+net.ipv4.tcp_wmem = 4096 16384 2097152
+vm.vfs_cache_pressure = 150
+vm.swappiness = 20
+vm.min_free_kbytes = 32768
+EOF
+
+elif [ "$TOTAL_MEM_MB" -le 2500 ]; then
+    cat >> $SYSCTL_FILE <<EOF
+
+# === TIER 2: 2GB RAM (BALANCED MODE) ===
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 87380 8388608
+net.ipv4.tcp_wmem = 4096 32768 8388608
+vm.vfs_cache_pressure = 100
+vm.swappiness = 10
+vm.min_free_kbytes = 65536
+net.core.netdev_max_backlog = 4096
+EOF
+
+elif [ "$TOTAL_MEM_MB" -le 8500 ]; then
+    cat >> $SYSCTL_FILE <<EOF
+
+# === TIER 3: 4-8GB RAM (PERFORMANCE MODE) ===
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 524288
+net.core.wmem_default = 524288
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+vm.swappiness = 10
+vm.min_free_kbytes = 131072
+net.core.netdev_max_backlog = 16384
+# Больше окна под данные (меньше под метаданные) — +5-15% throughput
+net.ipv4.tcp_adv_win_scale = -2
+EOF
+
+else
+    cat >> $SYSCTL_FILE <<EOF
+
+# === TIER 4: 8GB+ RAM (ULTRA 10G MODE) ===
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 87380 33554432
+vm.swappiness = 10
+vm.min_free_kbytes = 262144
+net.core.netdev_max_backlog = 32768
+net.ipv4.tcp_adv_win_scale = -2
+EOF
+fi
+
+print_ok "Конфиг сохранён: $SYSCTL_FILE"
+
+# Показываем конфиг
+print_info "Содержимое конфигурации:"
+echo ""
+echo -e "${CYAN}───────────────────────────────────────────────────────────────────${NC}"
+cat $SYSCTL_FILE
+echo -e "${CYAN}───────────────────────────────────────────────────────────────────${NC}"
+echo ""
+
+# Применяем sysctl конфиги явно (БЕЗ --system, чтобы IPv6-отключение
+# не применилось сейчас и не оборвало SSH — оно применится после ребута)
+print_status "Применяем sysctl конфигурацию (tuning + conntrack, без IPv6)..."
+for f in /etc/sysctl.d/99-xray-tuning.conf \
+          /etc/sysctl.d/99-conntrack.conf; do
+    [ -f "$f" ] && sysctl -p "$f" 2>/dev/null | tail -3
+done
+print_ok "Sysctl применён (BBR и qdisc активируются после ребута на XanMod; IPv6 — после ребута)"
+
+# ==============================================================================
+# ШАГ 7.5: НАСТРОЙКА QDISC (Multi-Queue / Single-Queue)
+# ==============================================================================
+
+print_header "ШАГ 7.5: НАСТРОЙКА QDISC (FQ / MQ+FQ)"
+
+print_status "Определяем активный сетевой интерфейс..."
+IFACE=$(ip route | awk '/default/ {print $5; exit}')
+
+if [ -z "$IFACE" ]; then
+    print_error "Не удалось определить default интерфейс! Пропускаем настройку qdisc."
+else
+    print_ok "Интерфейс: $IFACE"
+
+    # Считаем количество TX очередей
+    QUEUES=$(ls /sys/class/net/$IFACE/queues/ 2>/dev/null | grep -c tx)
+    print_status "Анализируем структуру очередей..."
+    echo -e "    ├─ CPU ядер: ${GREEN}$(nproc)${NC}"
+    echo -e "    └─ TX очередей: ${GREEN}$QUEUES${NC}"
+    echo ""
+
+    if [ "$QUEUES" -gt 1 ]; then
+        # Multi-queue NIC: ставим mq как root, на каждую queue — fq
+        print_status "Настраиваем Multi-Queue (mq + fq per-queue)..."
+
+        # Проверяем текущий root qdisc — если уже mq, не трогаем (избегаем drop пакетов)
+        CURRENT_ROOT=$(tc qdisc show dev $IFACE | awk '/qdisc/ && /root/ {print $2; exit}')
+        if [ "$CURRENT_ROOT" = "mq" ]; then
+            print_info "Root qdisc уже mq — пропускаем replace (без drop пакетов)"
+        else
+            # add вместо replace когда возможно
+            tc qdisc add dev $IFACE root handle 1: mq 2>/dev/null || \
+                tc qdisc replace dev $IFACE root handle 1: mq 2>/dev/null
+        fi
+
+        # Ждём пока mq создаст sub-qdisc'ы
+        sleep 1
+        MQ_HANDLE=$(tc qdisc show dev $IFACE | awk '/qdisc mq/ {print $3}' | head -1)
+
+        if [ -n "$MQ_HANDLE" ]; then
+            # Фикс hex-индексации: для 16+ очередей нужен правильный hex
+            # mq использует индексы 1..N в hex (1, 2, ... 9, a, b, ... f, 10, 11, ...)
+            APPLIED=0
+            for i in $(seq 1 $QUEUES); do
+                HEX_IDX=$(printf '%x' "$i")
+                # Проверяем есть ли уже fq на этой child queue — если да, пропускаем
+                EXISTING=$(tc qdisc show dev $IFACE | grep "parent ${MQ_HANDLE}${HEX_IDX} " | grep -c fq)
+                if [ "$EXISTING" -eq 0 ]; then
+                    if tc qdisc add dev $IFACE parent ${MQ_HANDLE}${HEX_IDX} fq 2>/dev/null; then
+                        APPLIED=$((APPLIED + 1))
+                    elif tc qdisc change dev $IFACE parent ${MQ_HANDLE}${HEX_IDX} fq 2>/dev/null; then
+                        APPLIED=$((APPLIED + 1))
+                    fi
+                else
+                    APPLIED=$((APPLIED + 1))
+                fi
+            done
+            print_ok "Multi-Queue настроен: $APPLIED/$QUEUES очередей с fq"
+        else
+            print_info "mq уже инициализирован с default_qdisc=fq"
+        fi
+        QDISC_MODE="mq + fq (per-queue, $QUEUES queues)"
+    else
+        # Single-queue: один fq на root (через add если можно — без drop)
+        print_status "Настраиваем Single-Queue (fq)..."
+        CURRENT_ROOT=$(tc qdisc show dev $IFACE | awk '/qdisc/ && /root/ {print $2; exit}')
+        if [ "$CURRENT_ROOT" = "fq" ]; then
+            print_info "fq уже активен — пропускаем"
+        else
+            tc qdisc add dev $IFACE root fq 2>/dev/null || tc qdisc replace dev $IFACE root fq
+        fi
+        print_ok "Single-Queue настроен: fq на root"
+        QDISC_MODE="fq (single-queue)"
+    fi
+
+    echo ""
+    print_info "Текущая структура qdisc:"
+    echo -e "${CYAN}───────────────────────────────────────────────────────────────────${NC}"
+    tc qdisc show dev $IFACE
+    echo -e "${CYAN}───────────────────────────────────────────────────────────────────${NC}"
+fi
+
+# ==============================================================================
+# ШАГ 7.6: НАСТРОЙКА RPS (Receive Packet Steering)
+# ==============================================================================
+
+print_header "ШАГ 7.6: НАСТРОЙКА RPS"
+
+CPUS=$(nproc)
+
+if [ "$CPUS" -le 1 ]; then
+    print_info "1 CPU — RPS не имеет смысла, пропускаем"
+    # Удаляем сервис если остался от предыдущих запусков
+    if [ -f /etc/systemd/system/rps-tuning.service ]; then
+        print_status "Удаляем устаревший rps-tuning.service..."
+        systemctl disable --now rps-tuning.service 2>/dev/null
+        rm -f /etc/systemd/system/rps-tuning.service /usr/local/sbin/rps-tuning.sh
+        systemctl daemon-reload
+        print_ok "Старый сервис удалён"
+    fi
+    RPS_MODE="disabled (single CPU)"
+elif [ -z "$IFACE" ]; then
+    print_info "Интерфейс не определён, пропускаем RPS"
+    RPS_MODE="skipped"
+else
+    # Проверяем количество HW очередей
+    HW_QUEUES=$(ls /sys/class/net/$IFACE/queues/ 2>/dev/null | grep -c rx)
+
+    print_status "Анализ необходимости RPS..."
+    echo -e "    ├─ CPU ядер: ${GREEN}$CPUS${NC}"
+    echo -e "    ├─ RX очередей: ${GREEN}$HW_QUEUES${NC}"
+
+    if [ "$HW_QUEUES" -ge "$CPUS" ]; then
+        echo -e "    └─ Решение: ${YELLOW}HW multi-queue достаточно, RPS не нужен${NC}"
+        echo ""
+        print_info "Сетевая карта имеет $HW_QUEUES очередей на $CPUS CPU — параллелизм уже на уровне железа"
+        # Удаляем сервис если остался от предыдущих запусков
+        if [ -f /etc/systemd/system/rps-tuning.service ]; then
+            print_status "Удаляем устаревший rps-tuning.service..."
+            systemctl disable --now rps-tuning.service 2>/dev/null
+            rm -f /etc/systemd/system/rps-tuning.service /usr/local/sbin/rps-tuning.sh
+            systemctl daemon-reload
+            print_ok "Старый сервис удалён"
+        fi
+        RPS_MODE="not needed (HW multi-queue)"
+    else
+        # Битовая маска для всех CPU: (1 << N) - 1, в hex
+        MASK=$(printf "%x" $(( (1 << CPUS) - 1 )))
+        echo -e "    └─ Решение: ${GREEN}включаем RPS (mask=$MASK)${NC}"
+        echo ""
+
+        print_status "Создаём /usr/local/sbin/rps-tuning.sh..."
+        cat > /usr/local/sbin/rps-tuning.sh <<'RPSEOF'
+#!/bin/bash
+# Auto-generated by VPN Node Builder
+IFACE=$(ip route | awk '/default/ {print $5; exit}')
+[ -z "$IFACE" ] && exit 0
+CPUS=$(nproc)
+[ "$CPUS" -le 1 ] && exit 0
+MASK=$(printf "%x" $(( (1 << CPUS) - 1 )))
+for q in /sys/class/net/$IFACE/queues/rx-*/rps_cpus; do
+    [ -w "$q" ] && echo $MASK > $q
+done
+echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
+for q in /sys/class/net/$IFACE/queues/rx-*/rps_flow_cnt; do
+    [ -w "$q" ] && echo 32768 > $q
+done
+RPSEOF
+        chmod +x /usr/local/sbin/rps-tuning.sh
+        print_ok "Скрипт RPS создан"
+
+        print_status "Создаём systemd-сервис rps-tuning.service..."
+        cat > /etc/systemd/system/rps-tuning.service <<'SVCEOF'
 [Unit]
-Description=Update scanner blocklist (Shodan, Censys, gov scanners)
-After=network-online.target nftables.service
+Description=RPS Tuning for VPN Node
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$UPDATER_SCRIPT
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-EOF
-
-cat > /etc/systemd/system/scanner-blocklist-update.timer <<'EOF'
-[Unit]
-Description=Update scanner blocklist every 6 hours
-Requires=scanner-blocklist-update.service
-
-[Timer]
-# Первый запуск через 30 секунд после boot (чтобы nft уже точно был готов)
-OnBootSec=30s
-# Потом каждые 6 часов
-OnUnitActiveSec=6h
-# Если пропустили запуск (сервер был выключен) — догнать сразу
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl daemon-reload
-systemctl enable scanner-blocklist-update.timer >/dev/null 2>&1
-
-# Запускаем сразу первый апдейт (blocking)
-print_status "Качаю scanner blocklist (первый запуск)..."
-if systemctl start scanner-blocklist-update.service; then
-    sleep 2
-    BLOCKLIST_V4_SIZE=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | grep -c '/' || echo 0)
-    BLOCKLIST_V6_SIZE=$(nft list set inet ddos_protect scanner_blocklist_v6 2>/dev/null | grep -c '/' || echo 0)
-    if [ "$BLOCKLIST_V4_SIZE" -gt 0 ]; then
-        print_ok "Blocklist загружен: $BLOCKLIST_V4_SIZE v4 / $BLOCKLIST_V6_SIZE v6 подсетей"
-    else
-        print_warn "Blocklist пуст — проверь логи: journalctl -u scanner-blocklist-update"
-    fi
-else
-    print_warn "Первый запуск updater'а провалился — продолжаем без blocklist"
-    print_info "Проверь: journalctl -u scanner-blocklist-update -n 30"
-fi
-
-systemctl start scanner-blocklist-update.timer >/dev/null 2>&1
-print_ok "Timer активен (обновление каждые 6 часов)"
-
-# ==============================================================================
-# ШАГ 7: УСТАНОВКА CROWDSEC
-# ==============================================================================
-
-print_header "ШАГ 7: УСТАНОВКА CROWDSEC"
-
-if ! command -v cscli >/dev/null 2>&1; then
-    print_status "Подключаю репозиторий CrowdSec..."
-    curl -fsSL https://install.crowdsec.net | bash >/dev/null 2>&1 || {
-        print_error "Не удалось подключить репозиторий CrowdSec"
-        exit 1
-    }
-    print_status "Устанавливаю crowdsec..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec >/dev/null 2>&1 || {
-        print_error "Установка crowdsec провалилась"
-        exit 1
-    }
-fi
-print_ok "CrowdSec: $(cscli version 2>&1 | head -1 || echo установлен)"
-
-# Коллекции
-# v1.4: убрана crowdsecurity/iptables — она порождает сценарий
-# iptables-scan-multi_ports который банит за подключения к разным портам.
-# Это ложно срабатывает на VPN-юзеров, у которых в профиле прописано
-# несколько Xray-портов (fallback при блокировках). Защита от настоящих
-# port-scan'еров теперь делается scanner_blocklist'ом + nft rate-limit'ом.
-COLLECTIONS=(
-    "crowdsecurity/linux"
-    "crowdsecurity/sshd"
-)
-
-for col in "${COLLECTIONS[@]}"; do
-    if cscli collections list 2>/dev/null | grep -q "^$col"; then
-        print_info "Уже установлена: $col"
-    else
-        print_status "Устанавливаю $col..."
-        if cscli collections install "$col" >/dev/null 2>&1; then
-            print_ok "$col"
-        else
-            print_warn "Не удалось установить $col"
-        fi
-    fi
-done
-
-# v1.4: удаляем iptables-коллекцию если осталась с v1.3 (false positive prone)
-if cscli collections list 2>/dev/null | grep -q "^crowdsecurity/iptables"; then
-    print_status "Удаляю crowdsecurity/iptables (v1.4: ложно банит юзеров)..."
-    cscli collections remove crowdsecurity/iptables >/dev/null 2>&1 && \
-        print_ok "crowdsecurity/iptables удалена"
-fi
-
-# ==============================================================================
-# ШАГ 8: SSH-KEY AUTO-WHITELIST
-# ==============================================================================
-
-print_header "ШАГ 8: SSH-KEY AUTO-WHITELIST"
-
-# v1.2: динамический whitelist по успешному key-auth.
-# Двойная защита:
-#   1. Postoverflow-парсер — отбрасывает алерты от whitelisted IP до того,
-#      как они дойдут до bouncer'а (защита от собственных сценариев типа
-#      ssh-bf, http-crawl-non_statics).
-#   2. Decision-whitelist через cscli — перебивает community blocklist.
-#      Если твой IP вдруг попал в общий бан-лист (бывает на shared NAT
-#      или мобильных провайдерах), ты всё равно зайдёшь.
-
-# --- 6a. Postoverflow parser ---
-WHITELIST_PARSER="/etc/crowdsec/postoverflows/s01-whitelist/ssh-key-whitelist.yaml"
-mkdir -p "$(dirname "$WHITELIST_PARSER")"
-
-# v1.2: используем уже существующий decision-whitelist через cscli.
-# Postoverflow-фильтр проверяет наличие decision'а с типом whitelist.
-cat > "$WHITELIST_PARSER" <<'EOF'
-# Generated by vpn-node-ddos-protect v1.2
-# Сбрасывает overflow-сигналы для IP, которые уже в decisions whitelist.
-# Парные decision'ы создаёт сервис cs-ssh-whitelist.service (см. ниже).
-name: admin/ssh-key-whitelist
-description: "Drop alerts from IPs whitelisted via successful SSH publickey auth"
-whitelist:
-  reason: "ssh-key-auth dynamic whitelist"
-  expression:
-    - "evt.Overflow.Sources != nil"
-EOF
-
-chmod 0644 "$WHITELIST_PARSER"
-print_ok "Postoverflow parser: $WHITELIST_PARSER"
-
-# --- 6b. Watcher script ---
-CS_HOOK_SCRIPT="/usr/local/sbin/cs-ssh-key-whitelist.sh"
-
-cat > "$CS_HOOK_SCRIPT" <<'WATCHER_EOF'
-#!/bin/bash
-# Watches sshd journal for successful publickey logins, adds source IP
-# to crowdsec decisions as whitelist for 12h.
-# Started by cs-ssh-whitelist.service.
-#
-# v1.5 SECURITY NOTE: ловится ТОЛЬКО "Accepted publickey".
-# Это безопасно даже если PasswordAuthentication=yes:
-#   - "Accepted password"        → НЕ whitelist (атакующий с паролем не попадёт)
-#   - "Accepted keyboard-..."    → НЕ whitelist
-#   - "Accepted publickey"       → whitelist (только владелец ключа)
-# Таким образом, скрипт работает корректно в любой конфигурации SSH.
-
-WHITELIST_DURATION="12h"
-DEBOUNCE_SEC=60  # v1.9: не обновлять whitelist для того же IP чаще раз в 60 сек
-DEBOUNCE_DIR="/run/cs-ssh-whitelist"
-mkdir -p "$DEBOUNCE_DIR"
-
-# Используем journalctl с --since=now чтобы не обрабатывать старые записи
-# при перезапуске сервиса (иначе при рестарте можно whitelist'ить IP'шки
-# которых давно не существует).
-journalctl _SYSTEMD_UNIT=ssh.service _SYSTEMD_UNIT=sshd.service \
-    -f -n 0 --output=cat --since=now 2>/dev/null | \
-while IFS= read -r line; do
-    case "$line" in
-        *"Accepted publickey for"*)
-            # Парсим: Accepted publickey for USER from IP port PORT ssh2: KEYTYPE FP
-            IP=$(printf '%s\n' "$line" | grep -oE 'from [0-9a-fA-F.:]+' | awk '{print $2}')
-            USER=$(printf '%s\n' "$line" | grep -oE 'for [^ ]+' | awk '{print $2}')
-
-            # Sanity checks
-            case "$IP" in
-                ""|127.0.0.1|::1) continue ;;
-                *[!0-9a-fA-F.:]*)  continue ;;
-            esac
-
-            # v1.9: debounce — пропускаем cscli если этот IP логинился < 60 сек назад.
-            # Защита от шторма forks при множественных одновременных логинах
-            # (например, ansible / fabric / parallel-ssh).
-            DEBOUNCE_FILE="$DEBOUNCE_DIR/$(echo "$IP" | tr ':' '_')"
-            NOW=$(date +%s)
-            if [ -f "$DEBOUNCE_FILE" ]; then
-                LAST=$(cat "$DEBOUNCE_FILE" 2>/dev/null)
-                if [ -n "$LAST" ] && [ $((NOW - LAST)) -lt "$DEBOUNCE_SEC" ]; then
-                    # Слишком частые логины с этого IP — пропускаем cscli
-                    continue
-                fi
-            fi
-            echo "$NOW" > "$DEBOUNCE_FILE"
-
-            # Идемпотентность: если IP уже в whitelist — продлеваем (delete + add)
-            cscli decisions delete --ip "$IP" --type whitelist >/dev/null 2>&1 || true
-            cscli decisions add \
-                --ip "$IP" \
-                --type whitelist \
-                --duration "$WHITELIST_DURATION" \
-                --reason "ssh-key-auth user=$USER" >/dev/null 2>&1
-
-            logger -t cs-ssh-whitelist "Whitelisted $IP for $WHITELIST_DURATION (user=$USER)"
-            ;;
-    esac
-done
-WATCHER_EOF
-
-chmod 0755 "$CS_HOOK_SCRIPT"
-print_ok "Watcher: $CS_HOOK_SCRIPT"
-
-# --- 6c. Systemd unit ---
-cat > /etc/systemd/system/cs-ssh-whitelist.service <<EOF
-[Unit]
-Description=CrowdSec SSH key-auth auto-whitelist
-After=crowdsec.service ssh.service systemd-journald.service
-Wants=crowdsec.service
-
-[Service]
-Type=simple
-ExecStart=$CS_HOOK_SCRIPT
-Restart=always
-RestartSec=10
-# Безопасность сервиса
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ReadWritePaths=/var/log
-# Сервису нужны: journalctl (read), cscli (запись decisions через socket).
-# v2.3 fix: leading "-" делает путь optional — если каталога нет, systemd
-# не падает с "Failed to set up mount namespacing". Это бывает когда
-# crowdsec ещё не создал /var/run/crowdsec (новая установка, до первого старта).
-ReadWritePaths=-/var/run/crowdsec
-ReadWritePaths=-/run/crowdsec
-# v2.1.1: дебаунс-кэш для предотвращения шторма cscli при множественных логинах
-ReadWritePaths=/run/cs-ssh-whitelist
-# Системд автоматически создаст каталог по этому пути перед стартом
-RuntimeDirectory=cs-ssh-whitelist
-RuntimeDirectoryMode=0700
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/rps-tuning.sh
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SVCEOF
+        print_ok "Сервис создан"
 
-systemctl daemon-reload
+        print_status "Активируем rps-tuning.service..."
+        systemctl daemon-reload
+        systemctl enable --now rps-tuning.service 2>/dev/null
 
-# --- 6d. Bootstrap текущего IP ---
-# Сервис стартует ПОСЛЕ crowdsec, но чтобы не ждать первого ре-логина —
-# сразу добавим текущий админский IP в whitelist.
-if [ -n "$ADMIN_IP" ]; then
-    # Сохраним bootstrap-команду на потом — выполним после старта crowdsec
-    BOOTSTRAP_IP="$ADMIN_IP"
+        # Проверка
+        ACTIVE_MASK=$(cat /sys/class/net/$IFACE/queues/rx-0/rps_cpus 2>/dev/null)
+        if [ "$ACTIVE_MASK" = "$MASK" ] || [ "$(echo $ACTIVE_MASK | tr -d 0,)" = "$(echo $MASK | tr -d 0,)" ]; then
+            print_ok "RPS активен: mask=$ACTIVE_MASK (распределение на $CPUS CPU)"
+            RPS_MODE="enabled (mask=$MASK, $CPUS CPU)"
+        else
+            print_info "RPS настроен, активная маска: $ACTIVE_MASK"
+            RPS_MODE="enabled"
+        fi
+    fi
 fi
 
 # ==============================================================================
-# ШАГ 9: BAN DURATION (4h — баланс между защитой и ложными срабатываниями)
+# ШАГ 7.7: БЕЗОПАСНЫЕ NIC БУСТЫ (ethtool / GRO / XPS / Ring Buffers)
 # ==============================================================================
 
-print_header "ШАГ 9: BAN DURATION"
+print_header "ШАГ 7.7: NIC ОПТИМИЗАЦИЯ (Безопасные бусты)"
 
-# v1.4: ban duration возвращён к дефолтным 4h (было 24h в v1.1-1.3).
-# Причина: при ложном срабатывании (юзер за CGNAT, общий IP с атакующим)
-# 24h блокировки = это пол-дня без VPN. 4h — приемлемо.
-# Атакующих ботнетов community blocklist подхватит и забанит снова
-# при следующем срабатывании — нет смысла держать долго.
+NIC_BOOSTS_APPLIED=()
 
-PROFILES_FILE="/etc/crowdsec/profiles.yaml"
-
-if [ -f "$PROFILES_FILE" ]; then
-    if [ ! -f "$BACKUP_DIR/profiles.yaml.before" ]; then
-        cp -a "$PROFILES_FILE" "$BACKUP_DIR/profiles.yaml.before"
+if [ -z "$IFACE" ]; then
+    print_info "Интерфейс не определён, пропускаем NIC бусты"
+else
+    # Проверяем наличие ethtool
+    if ! command -v ethtool >/dev/null 2>&1; then
+        print_status "Устанавливаем ethtool..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y ethtool >/dev/null 2>&1
     fi
 
-    # Если стоит 24h (от старой версии этого скрипта) — вернуть на 4h
-    if grep -qE "^[[:space:]]*duration:[[:space:]]*24h[[:space:]]*$" "$PROFILES_FILE"; then
-        sed -i '0,/^\([[:space:]]*\)duration:[[:space:]]*24h[[:space:]]*$/s//\1duration: 4h/' "$PROFILES_FILE"
-        print_ok "Ban duration: 24h → 4h (v1.4 user-friendly)"
-    elif grep -qE "^[[:space:]]*duration:[[:space:]]*4h[[:space:]]*$" "$PROFILES_FILE"; then
-        print_info "Ban duration уже 4h (дефолт CrowdSec)"
+    # === БУСТ 1: ethtool offloads (GRO/GSO/TSO/checksums) ===
+    print_status "Проверяем поддержку offload-функций драйвером..."
+    if ethtool -k "$IFACE" >/dev/null 2>&1; then
+        # Список offloads которые безопасно включать
+        OFFLOAD_LIST=("gro" "gso" "tso" "tx" "rx")
+        OFFLOAD_ENABLED=()
+
+        for off in "${OFFLOAD_LIST[@]}"; do
+            # Проверяем доступность флага (некоторые драйверы не поддерживают часть)
+            CURRENT=$(ethtool -k "$IFACE" 2>/dev/null | grep -E "^${off}-(offload|checksumming):" | head -1 | awk '{print $2}')
+            # Альтернативный формат
+            [ -z "$CURRENT" ] && CURRENT=$(ethtool -k "$IFACE" 2>/dev/null | grep -E "^${off}:" | head -1 | awk '{print $2}')
+
+            if [ "$CURRENT" = "off" ]; then
+                if ethtool -K "$IFACE" "$off" on 2>/dev/null; then
+                    OFFLOAD_ENABLED+=("$off")
+                fi
+            elif [ "$CURRENT" = "on" ]; then
+                OFFLOAD_ENABLED+=("$off=already-on")
+            fi
+        done
+
+        if [ ${#OFFLOAD_ENABLED[@]} -gt 0 ]; then
+            print_ok "Offload-функции: ${OFFLOAD_ENABLED[*]}"
+            NIC_BOOSTS_APPLIED+=("ethtool offloads")
+        else
+            print_info "Драйвер не поддерживает offload-tuning (виртуалка с paravirt?)"
+        fi
     else
-        CURRENT_DURATION=$(grep -m1 -E "^[[:space:]]*duration:" "$PROFILES_FILE" | awk '{print $2}')
-        print_info "Ban duration: $CURRENT_DURATION (custom — не трогаю)"
+        print_info "ethtool не работает с $IFACE — пропускаем offloads"
     fi
-else
-    print_warn "$PROFILES_FILE не найден — пропускаю"
-fi
 
-# ==============================================================================
-# ШАГ 10: ACQUISITION (источники логов для CrowdSec)
-# ==============================================================================
+    # === БУСТ 2: NIC Ring Buffers (увеличиваем СОЗНАТЕЛЬНО — может вызвать
+    #     короткий link-flap на 1-3 сек на некоторых драйверах: ixgbe, mlx5)
+    print_status "Анализируем NIC ring buffers..."
+    if ethtool -g "$IFACE" >/dev/null 2>&1; then
+        MAX_RX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/^RX:/ && !/Mini|Jumbo/ {print $2; exit}')
+        MAX_TX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/^TX:/ {print $2; exit}')
+        # Текущие значения (после "Current hardware settings:")
+        CUR_RX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Current hardware settings/{found=1; next} found && /^RX:/ && !/Mini|Jumbo/ {print $2; exit}')
+        CUR_TX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Current hardware settings/{found=1; next} found && /^TX:/ {print $2; exit}')
 
-print_header "ШАГ 10: ACQUISITION"
+        if [ -n "$MAX_RX" ] && [ -n "$MAX_TX" ] && [ "$MAX_RX" != "n/a" ] && [ "$MAX_RX" -gt 0 ] 2>/dev/null; then
+            echo -e "    ├─ Max RX/TX: ${GREEN}$MAX_RX/$MAX_TX${NC}"
+            echo -e "    ├─ Cur RX/TX: ${GREEN}$CUR_RX/$CUR_TX${NC}"
 
-# v1.4: убрана UFW/iptables acquisition. В v1.1-1.3 она питала сценарий
-# crowdsecurity/iptables-scan-multi_ports который ложно срабатывал на
-# VPN-юзеров с многопортовыми профилями. Без iptables-коллекции и UFW
-# acquisition этот сценарий не запускается.
-#
-# Оставляем только дефолтные acquisition (auth.log, journal) которые
-# приходят с коллекцией crowdsecurity/sshd. Они нужны для:
-#   - SSH bruteforce detection
-#   - regreSSHion (CVE-2024-6387)
-#   - SSH-key auto-whitelist watcher
+            # Применяем только если есть смысл (current < max и разница хотя бы 4x)
+            # 4x порог — на mlx5/ixgbe при меньшей разнице link-flap не оправдан
+            # И не на virtio (там почти всегда max=current и команда no-op)
+            DRIVER=$(ethtool -i "$IFACE" 2>/dev/null | awk '/^driver:/ {print $2}')
 
-ACQUIS_DIR="/etc/crowdsec/acquis.d"
-
-# Удаляем UFW acquisition если он был создан старой версией скрипта
-OLD_UFW_ACQUIS="$ACQUIS_DIR/ufw.yaml"
-if [ -f "$OLD_UFW_ACQUIS" ]; then
-    if grep -q "vpn-node-ddos-protect" "$OLD_UFW_ACQUIS" 2>/dev/null; then
-        rm -f "$OLD_UFW_ACQUIS"
-        print_ok "Удалён UFW acquisition (v1.4: source для ложных банов)"
+            if [ "$DRIVER" = "virtio_net" ]; then
+                print_info "virtio_net: ring buffers тюнинг не применим, пропускаем (без link-flap)"
+            elif [ -n "$CUR_RX" ] && [ "$CUR_RX" = "$MAX_RX" ]; then
+                print_info "Ring buffers уже на максимуме, пропускаем"
+            elif [ -n "$CUR_RX" ] && [ "$((MAX_RX / CUR_RX))" -lt 4 ] 2>/dev/null; then
+                print_info "Прирост <4x (${CUR_RX}→${MAX_RX}), пропускаем (link-flap не оправдан)"
+            else
+                # Только тут реально применяем — выгода оправдывает короткий разрыв
+                print_status "Применяем ring buffers (возможен link-flap 1-3 сек)..."
+                if ethtool -G "$IFACE" rx "$MAX_RX" tx "$MAX_TX" 2>/dev/null; then
+                    print_ok "Ring buffers: RX=$MAX_RX, TX=$MAX_TX (было RX=$CUR_RX/$CUR_TX)"
+                    NIC_BOOSTS_APPLIED+=("ring buffers max")
+                else
+                    print_info "Драйвер не позволяет менять ring buffers"
+                fi
+            fi
+        else
+            print_info "Драйвер не сообщает max ring buffer size"
+        fi
     fi
-fi
 
-# Проверим что SSH acquisition (от sshd-коллекции) на месте
-if cscli collections list 2>/dev/null | grep -q "^crowdsecurity/sshd"; then
-    print_ok "SSH acquisition активен (через crowdsecurity/sshd)"
-else
-    print_warn "crowdsecurity/sshd не установлен — SSH-логи не парсятся"
-fi
+    # === БУСТ 3: GRO Flush Timeout + napi_defer_hard_irqs ===
+    # Безопасные значения: gro_flush=50µs, napi_defer=1
+    # (выше значения дают больше CPU savings, но рискуют latency на прерывистом трафике)
+    print_status "Настраиваем GRO flush + napi defer (батчинг прерываний)..."
+    GRO_PATH="/sys/class/net/$IFACE/gro_flush_timeout"
+    NAPI_PATH="/sys/class/net/$IFACE/napi_defer_hard_irqs"
 
-# ==============================================================================
-# ШАГ 11: NFTABLES BOUNCER
-# ==============================================================================
-
-print_header "ШАГ 11: NFTABLES BOUNCER"
-
-if dpkg -l crowdsec-firewall-bouncer-nftables &>/dev/null; then
-    print_info "Bouncer уже установлен"
-else
-    print_status "Устанавливаю crowdsec-firewall-bouncer-nftables..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec-firewall-bouncer-nftables >/dev/null 2>&1 || {
-        print_error "Установка bouncer'а провалилась"
-        exit 1
-    }
-    print_ok "Bouncer установлен"
-fi
-
-if ! cscli bouncers list 2>/dev/null | grep -q "cs-firewall-bouncer"; then
-    print_status "Регистрирую bouncer в LAPI..."
-    BOUNCER_KEY=$(cscli bouncers add cs-firewall-bouncer-nftables -o raw 2>/dev/null)
-    if [ -n "$BOUNCER_KEY" ]; then
-        sed -i "s|^api_key:.*|api_key: $BOUNCER_KEY|" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
-        print_ok "Bouncer зарегистрирован"
-    fi
-fi
-
-systemctl enable --now crowdsec >/dev/null 2>&1 || true
-systemctl enable --now crowdsec-firewall-bouncer >/dev/null 2>&1 || true
-systemctl enable --now cs-ssh-whitelist >/dev/null 2>&1 || true
-
-sleep 3
-
-# Bootstrap: добавляем текущий IP в whitelist (после старта crowdsec)
-if [ -n "${BOOTSTRAP_IP:-}" ]; then
-    if cscli decisions add --ip "$BOOTSTRAP_IP" --type whitelist \
-        --duration 12h --reason "ssh-key-auth bootstrap" >/dev/null 2>&1; then
-        print_ok "Bootstrap whitelist: $BOOTSTRAP_IP на 12h"
+    if [ -w "$GRO_PATH" ] && [ -w "$NAPI_PATH" ]; then
+        # Сохраняем текущие значения для отката если что-то сломается
+        OLD_GRO=$(cat "$GRO_PATH" 2>/dev/null)
+        OLD_NAPI=$(cat "$NAPI_PATH" 2>/dev/null)
+        echo 50000 > "$GRO_PATH" 2>/dev/null
+        echo 1 > "$NAPI_PATH" 2>/dev/null
+        # Проверяем что значение реально применилось
+        NEW_GRO=$(cat "$GRO_PATH" 2>/dev/null)
+        if [ "$NEW_GRO" = "50000" ]; then
+            print_ok "GRO flush timeout: 50µs, napi_defer: 1 (-15-25% CPU на softirq)"
+            NIC_BOOSTS_APPLIED+=("GRO flush + napi defer")
+        else
+            # Откат если не применилось
+            echo "$OLD_GRO" > "$GRO_PATH" 2>/dev/null
+            echo "$OLD_NAPI" > "$NAPI_PATH" 2>/dev/null
+            print_info "GRO flush не применился, откатили"
+        fi
     else
-        print_warn "Не удалось добавить bootstrap whitelist (crowdsec не готов)"
-        print_info "Это ок — при следующем SSH-логине сработает auto-whitelist"
+        print_info "GRO flush недоступен (старое ядро или виртуалка)"
     fi
-fi
 
-if systemctl is-active --quiet crowdsec && systemctl is-active --quiet crowdsec-firewall-bouncer; then
-    print_ok "crowdsec + bouncer активны"
-else
-    print_warn "Один из сервисов не active:"
-    systemctl is-active crowdsec || print_error "  crowdsec НЕ active"
-    systemctl is-active crowdsec-firewall-bouncer || print_error "  bouncer НЕ active"
-    print_info "Логи: journalctl -u crowdsec -u crowdsec-firewall-bouncer -n 50"
-fi
+    # === БУСТ 4: XPS (Transmit Packet Steering) ===
+    # На 32+ CPU битовая маска может переполниться — пропускаем для безопасности
+    if [ "$CPUS" -gt 1 ] && [ "$CPUS" -lt 32 ]; then
+        print_status "Настраиваем XPS (распределение TX по CPU)..."
+        XPS_APPLIED=0
+        TX_QUEUES=$(ls /sys/class/net/"$IFACE"/queues/ 2>/dev/null | grep -c tx)
 
-if systemctl is-active --quiet cs-ssh-whitelist; then
-    print_ok "cs-ssh-whitelist активен (мониторит SSH-логины)"
-else
-    print_warn "cs-ssh-whitelist НЕ active"
-    print_info "Логи: journalctl -u cs-ssh-whitelist -n 50"
-fi
+        if [ "$TX_QUEUES" -gt 0 ]; then
+            # Распределяем CPU по TX очередям равномерно
+            for tx_q in /sys/class/net/"$IFACE"/queues/tx-*; do
+                [ ! -d "$tx_q" ] && continue
+                Q_NUM=$(basename "$tx_q" | sed 's/tx-//')
+                # CPU для этой очереди = Q_NUM % CPUS (round-robin)
+                CPU_FOR_Q=$((Q_NUM % CPUS))
+                CPU_MASK=$(printf "%x" $((1 << CPU_FOR_Q)))
 
-# ==============================================================================
-# ШАГ 12: УСТАНОВКА КОМАНДЫ guard (снимок состояния)
-# ==============================================================================
+                if [ -w "$tx_q/xps_cpus" ]; then
+                    if echo "$CPU_MASK" > "$tx_q/xps_cpus" 2>/dev/null; then
+                        XPS_APPLIED=$((XPS_APPLIED + 1))
+                    fi
+                fi
+            done
 
-print_header "ШАГ 12: УСТАНОВКА КОМАНДЫ guard"
+            if [ "$XPS_APPLIED" -gt 0 ]; then
+                print_ok "XPS активен: $XPS_APPLIED TX очередей распределены по $CPUS CPU"
+                NIC_BOOSTS_APPLIED+=("XPS ($XPS_APPLIED queues)")
+            else
+                print_info "XPS не применился (драйвер не поддерживает)"
+            fi
+        fi
+    elif [ "$CPUS" -ge 32 ]; then
+        print_info "32+ CPU — XPS пропущен (используется RSS железа)"
+    else
+        print_info "1 CPU — XPS не нужен"
+    fi
 
-# Команда показывает текущее состояние защиты ОДНИМ снимком:
-#   - Статус всех сервисов (CrowdSec, bouncer, watcher'ы)
-#   - Защищаемые порты (TCP/UDP)
-#   - Сколько IP заблокировано прямо сейчас
-#   - Активные whitelist'ы
-#   - Когда последний раз обновлялся blocklist
-#
-# v2.1: команда работает в one-shot режиме — никакой фоновой нагрузки,
-# никаких циклов. Каждый запуск — независимый snapshot.
-#
-# Запуск:
-#   sudo guard          текстовый снимок
-#   sudo guard --json   JSON для интеграций (Zabbix/Prometheus/боты)
-#   sudo watch -n 5 guard   "live"-режим через стандартный watch(1)
+    # === БУСТ 5: IRQ Affinity (распределение прерываний RX/TX очередей по CPU) ===
+    # Без этого все прерывания сыпятся на CPU0 → бутылочное горлышко на 10G/multi-queue
+    # ВАЖНО: irqbalance конфликтует с ручным affinity — отключаем его ТОЛЬКО если
+    # реально применили affinity (на single-queue NIC он полезен — пусть работает)
+    if [ "$CPUS" -gt 1 ] && [ -n "$IFACE" ]; then
+        print_status "Анализируем IRQ сетевого интерфейса $IFACE..."
 
-GUARD_BIN="/usr/local/bin/guard"
+        # Собираем IRQ номера сетевой карты из /proc/interrupts
+        # Формат строк: " 123: ... ethX-rx-0" или "iface-TxRx-0" (зависит от драйвера)
+        NIC_IRQS=$(grep -E "(^|[[:space:]])${IFACE}(-|$)" /proc/interrupts 2>/dev/null | awk -F: '{gsub(/ /,"",$1); print $1}')
 
-cat > "$GUARD_BIN" <<'GUARD_EOF'
+        if [ -z "$NIC_IRQS" ]; then
+            print_info "IRQ для $IFACE не найдены в /proc/interrupts (virtio/paravirt? пропускаем)"
+            IRQ_AFFINITY_MODE="skipped (no IRQs)"
+        else
+            IRQ_COUNT=$(echo "$NIC_IRQS" | wc -l)
+            echo -e "    ├─ IRQ найдено: ${GREEN}$IRQ_COUNT${NC}"
+            echo -e "    └─ Стратегия: round-robin по $CPUS CPU"
+
+            # Проверяем не работает ли irqbalance — если да, исключаем NIC IRQ из его контроля
+            # вместо полного отключения (irqbalance полезен для других IRQ — диски, USB)
+            IRQBALANCE_ACTIVE=0
+            if systemctl is-active irqbalance &>/dev/null; then
+                IRQBALANCE_ACTIVE=1
+                print_status "Обнаружен активный irqbalance — настраиваем IRQBALANCE_BANNED_CPULIST..."
+
+                # Создаём banned IRQ список для irqbalance (не отключаем сервис целиком)
+                mkdir -p /etc/default
+                BANNED_IRQS=$(echo "$NIC_IRQS" | tr '\n' ' ' | sed 's/ $//')
+
+                # Пишем drop-in конфиг (не трогаем основной /etc/default/irqbalance)
+                if [ -f /etc/default/irqbalance ]; then
+                    # Удаляем старую запись если была
+                    sed -i '/^IRQBALANCE_BANNED_INTERRUPTS=/d' /etc/default/irqbalance
+                    echo "IRQBALANCE_BANNED_INTERRUPTS=\"$BANNED_IRQS\"" >> /etc/default/irqbalance
+                    systemctl restart irqbalance 2>/dev/null || true
+                    print_ok "irqbalance настроен: NIC IRQs ($IRQ_COUNT шт.) исключены из его управления"
+                fi
+            fi
+
+            # Применяем round-robin affinity: IRQ N → CPU (N % CPUS)
+            APPLIED_IRQ=0
+            IRQ_INDEX=0
+            for irq in $NIC_IRQS; do
+                if [ -w "/proc/irq/$irq/smp_affinity" ]; then
+                    CPU_FOR_IRQ=$((IRQ_INDEX % CPUS))
+                    # Маска для одного CPU: 1 << N, в hex
+                    AFFINITY_MASK=$(printf "%x" $((1 << CPU_FOR_IRQ)))
+
+                    # Битовая маска должна совпадать по длине с smp_affinity для CPU 32+
+                    # Для <32 CPU короткая маска работает корректно
+                    if echo "$AFFINITY_MASK" > "/proc/irq/$irq/smp_affinity" 2>/dev/null; then
+                        APPLIED_IRQ=$((APPLIED_IRQ + 1))
+                    fi
+                fi
+                IRQ_INDEX=$((IRQ_INDEX + 1))
+            done
+
+            if [ "$APPLIED_IRQ" -gt 0 ]; then
+                print_ok "IRQ affinity: $APPLIED_IRQ/$IRQ_COUNT прерываний распределены по $CPUS CPU"
+                NIC_BOOSTS_APPLIED+=("IRQ affinity ($APPLIED_IRQ irqs)")
+                IRQ_AFFINITY_MODE="enabled ($APPLIED_IRQ irqs, round-robin)"
+            else
+                print_info "IRQ affinity не применился (возможно kernel не позволяет, или CPU isolation активен)"
+                IRQ_AFFINITY_MODE="failed"
+            fi
+        fi
+    else
+        IRQ_AFFINITY_MODE="skipped (single CPU or no iface)"
+    fi
+
+    # === Сохраняем NIC бусты в systemd-сервис (для применения после ребута) ===
+    if [ ${#NIC_BOOSTS_APPLIED[@]} -gt 0 ]; then
+        print_status "Создаём persistent systemd-сервис для NIC бустов..."
+
+        cat > /usr/local/sbin/nic-tuning.sh <<'NICEOF'
 #!/bin/bash
-# guard — minimalist snapshot dashboard для VPN-ноды.
-#
-# v2.3: минималистичный английский интерфейс + интерактив.
-#   sudo guard            снимок + интерактивное меню (1/2/3/4/r/0)
-#   sudo guard --json     JSON для интеграций
-#   sudo guard --once     снимок без меню (для cron/мониторинга)
-#   sudo guard --help     помощь
+# Auto-generated by VPN Node Builder v4.1
+# NIC optimization: GRO flush, XPS, ring buffers, offloads
+IFACE=$(ip route | awk '/default/ {print $5; exit}')
+[ -z "$IFACE" ] && exit 0
+CPUS=$(nproc)
 
-case "${1:-}" in
-    --help|-h)
-        cat <<HELP
-guard — VPN node protection snapshot
-
-Usage:
-  sudo guard            snapshot + interactive menu (1/2/3/4/r/0)
-  sudo guard --once     snapshot only, no menu (for cron / monitoring)
-  sudo guard --json     JSON output (for integrations)
-
-Interactive menu:
-  [1] show syn-flood IPs        [3] show whitelist IPs
-  [2] show crowdsec banned IPs  [4] show scanner blocklist samples
-  [r] refresh                   [0] exit
-
-HELP
-        exit 0
-        ;;
-esac
-
-if [[ $EUID -ne 0 ]]; then
-    echo "Run as root: sudo guard"
-    exit 1
-fi
-
-MODE="interactive"
-case "${1:-}" in
-    --json) MODE="json" ;;
-    --once) MODE="once" ;;
-esac
-
-# ANSI цвета
-if [ "$MODE" != "json" ] && [ -t 1 ]; then
-    R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'
-    M='\033[0;35m'; W='\033[1;37m'; B='\033[1m'; N='\033[0m'
-    DIM='\033[2m'
-else
-    R=''; G=''; Y=''; C=''; M=''; W=''; B=''; N=''; DIM=''
-fi
-
-CS_DB="/var/lib/crowdsec/data/crowdsec.db"
-
-# === СБОР МЕТРИК ===
-collect_stats() {
-    SYN_BAN=$(nft list set inet ddos_protect syn_flood_v4 2>/dev/null | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
-    SYN_BAN_V6=$(nft list set inet ddos_protect syn_flood_v6 2>/dev/null | grep -c 'expires')
-    SYN_BAN_V6="${SYN_BAN_V6:-0}"
-
-    UDP_BAN=$(nft list set inet ddos_protect udp_flood_v4 2>/dev/null | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
-
-    PROTECTED_TCP_LIST=$(nft list set inet ddos_protect protected_ports_tcp 2>/dev/null | \
-        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+(-[0-9]+)?' | \
-        sort -un | tr '\n' ',' | sed 's/,$//')
-    PROTECTED_UDP_LIST=$(nft list set inet ddos_protect protected_ports_udp 2>/dev/null | \
-        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+(-[0-9]+)?' | \
-        sort -un | tr '\n' ',' | sed 's/,$//')
-    PROTECTED_TCP_LIST="${PROTECTED_TCP_LIST:-—}"
-    PROTECTED_UDP_LIST="${PROTECTED_UDP_LIST:-—}"
-
-    BL_V4=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
-    BL_V6=$(nft list set inet ddos_protect scanner_blocklist_v6 2>/dev/null | grep -cE '^\s+[0-9a-f]+:')
-    BL_V6="${BL_V6:-0}"
-
-    MANUAL_WHITE=$(nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
-
-    CS_ACTIVE="$(systemctl is-active crowdsec 2>/dev/null)"
-    BOUNCER_ACTIVE="$(systemctl is-active crowdsec-firewall-bouncer 2>/dev/null)"
-    WATCHER_ACTIVE="$(systemctl is-active cs-ssh-whitelist 2>/dev/null)"
-    PORTS_PATH_ACTIVE="$(systemctl is-active protected-ports-update.path 2>/dev/null)"
-
-    CS_BANS=0
-    CS_WHITE=0
-    if [ -r "$CS_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
-        CS_BANS=$(sqlite3 "$CS_DB" "SELECT COUNT(*) FROM decisions WHERE type='ban' AND until > datetime('now')" 2>/dev/null)
-        CS_WHITE=$(sqlite3 "$CS_DB" "SELECT COUNT(*) FROM decisions WHERE type='whitelist' AND until > datetime('now')" 2>/dev/null)
-        CS_BANS="${CS_BANS:-0}"
-        CS_WHITE="${CS_WHITE:-0}"
-    elif command -v cscli >/dev/null 2>&1; then
-        CS_BANS=$(cscli decisions list --type ban -o raw 2>/dev/null | tail -n +2 | wc -l)
-        CS_WHITE=$(cscli decisions list --type whitelist -o raw 2>/dev/null | tail -n +2 | wc -l)
-    fi
-
-    LAST_UPDATE=$(systemctl show scanner-blocklist-update.service \
-        --property=ExecMainExitTimestamp --value 2>/dev/null | \
-        xargs -I{} date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
-    LAST_UPDATE="${LAST_UPDATE:-—}"
-}
-
-fmt_status() {
-    case "$1" in
-        active)        echo -e "${G}active${N}" ;;
-        inactive)      echo -e "${Y}inactive${N}" ;;
-        failed)        echo -e "${R}failed${N}" ;;
-        activating)    echo -e "${Y}activating${N}" ;;
-        *)             echo -e "${Y}${1:-—}${N}" ;;
-    esac
-}
-
-# === ВЫВОД ===
-draw_snapshot() {
-    local now=$(date '+%Y-%m-%d %H:%M:%S')
-    local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-
-    echo ""
-    echo -e "${C}╔══════════════════════════════════════════════════════════════════╗${N}"
-    printf "${C}║${N}  ${B}VPN GUARD${N} · %-15s · %s              ${C}║${N}\n" "$ip" "$now"
-    echo -e "${C}╚══════════════════════════════════════════════════════════════════╝${N}"
-    echo ""
-
-    echo -e "  ${B}Services${N}"
-    printf "  ├─ %-22s %b\n" "crowdsec"             "$(fmt_status "$CS_ACTIVE")"
-    printf "  ├─ %-22s %b\n" "firewall-bouncer"     "$(fmt_status "$BOUNCER_ACTIVE")"
-    printf "  ├─ %-22s %b\n" "cs-ssh-whitelist"     "$(fmt_status "$WATCHER_ACTIVE")"
-    printf "  └─ %-22s %b\n" "ports-path-watcher"   "$(fmt_status "$PORTS_PATH_ACTIVE")"
-    echo ""
-
-    echo -e "  ${B}Protected ports${N}"
-    printf "  ├─ %-10s ${C}%s${N}\n" "tcp" "$PROTECTED_TCP_LIST"
-    printf "  └─ %-10s ${C}%s${N}\n" "udp" "$PROTECTED_UDP_LIST"
-    echo ""
-
-    echo -e "  ${B}Blocked${N}"
-    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "syn-flood v4"            "$SYN_BAN"
-    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "syn-flood v6"            "$SYN_BAN_V6"
-    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "udp-flood v4"            "$UDP_BAN"
-    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "crowdsec bans"           "$CS_BANS"
-    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "scanner blocklist v4"    "$BL_V4"
-    printf "  └─ %-25s ${R}${B}%5d${N}\n" "scanner blocklist v6"    "$BL_V6"
-    echo ""
-
-    echo -e "  ${B}Whitelist${N}"
-    printf "  ├─ %-22s ${G}${B}%5d${N}\n" "ssh-key auto"   "$CS_WHITE"
-    printf "  └─ %-22s ${G}${B}%5d${N}\n" "manual"         "$MANUAL_WHITE"
-    echo ""
-
-    printf "  ${DIM}Scanner blocklist updated: %s${N}\n" "$LAST_UPDATE"
-}
-
-# === Просмотр списков ===
-show_syn_flood_ips() {
-    echo ""
-    echo -e "${B}SYN-flood IPs (TCP rate-limit)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-
-    # v2.4: используем JSON-вывод nft (надёжнее regex'а на текстовом формате)
-    local json4 json6
-    json4=$(nft -j list set inet ddos_protect syn_flood_v4 2>/dev/null)
-    json6=$(nft -j list set inet ddos_protect syn_flood_v6 2>/dev/null)
-
-    if command -v jq >/dev/null 2>&1 && [ -n "$json4" ]; then
-        echo "$json4" | jq -r '
-            .nftables[]?.set?.elem[]? |
-            (.elem.val // .val) as $ip |
-            (.elem.expires // .expires // 0) as $exp |
-            "  \($ip)  expires \($exp)s"
-        ' 2>/dev/null | head -50
-    else
-        # Fallback: текстовый парсинг (формат: "IP limit rate ... expires Xs")
-        nft list set inet ddos_protect syn_flood_v4 2>/dev/null | \
-            tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ limit rate[^,}]+expires [0-9smh]+' | \
-            awk '{
-                ip=$1
-                # expires — последнее поле
-                exp=$NF
-                printf "  %-18s expires %s\n", ip, exp
-            }' | head -50
-    fi
-
-    if [ -n "$json6" ] && command -v jq >/dev/null 2>&1; then
-        echo "$json6" | jq -r '
-            .nftables[]?.set?.elem[]? |
-            (.elem.val // .val) as $ip |
-            (.elem.expires // .expires // 0) as $exp |
-            "  \($ip)  expires \($exp)s"
-        ' 2>/dev/null | head -20
-    fi
-    echo ""
-}
-
-show_crowdsec_bans() {
-    echo ""
-    echo -e "${B}CrowdSec banned IPs${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-    if command -v cscli >/dev/null 2>&1; then
-        cscli decisions list --type ban 2>/dev/null | head -50
-    fi
-    echo ""
-}
-
-show_whitelist_ips() {
-    echo ""
-    echo -e "${B}Auto whitelist (SSH-key)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-    if command -v cscli >/dev/null 2>&1; then
-        cscli decisions list --type whitelist 2>/dev/null | head -50
-    fi
-    echo ""
-    echo -e "${B}Manual whitelist (nftables)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-    nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
-        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | \
-        sed 's/^/  /'
-    nft list set inet ddos_protect manual_whitelist_v6 2>/dev/null | \
-        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9a-f:]+(/[0-9]+)?' | \
-        sed 's/^/  /'
-    echo ""
-}
-
-show_scanner_samples() {
-    echo ""
-    echo -e "${B}Scanner blocklist (first 30 entries)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-    nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[0-9.]+)?(/[0-9]+)?' | \
-        head -30 | sed 's/^/  /'
-    echo ""
-    printf "  Total: ${B}%d${N} IPv4 + ${B}%d${N} IPv6\n" "$BL_V4" "$BL_V6"
-    echo ""
-}
-
-# === MODE: JSON ===
-if [ "$MODE" = "json" ]; then
-    collect_stats
-    cat <<JSON
-{
-  "timestamp": "$(date -Iseconds)",
-  "hostname": "$(hostname)",
-  "ip": "$(hostname -I 2>/dev/null | awk '{print $1}')",
-  "services": {
-    "crowdsec": "$CS_ACTIVE",
-    "bouncer": "$BOUNCER_ACTIVE",
-    "ssh_watcher": "$WATCHER_ACTIVE",
-    "ports_path_watcher": "$PORTS_PATH_ACTIVE"
-  },
-  "protected_ports": {
-    "tcp": "$PROTECTED_TCP_LIST",
-    "udp": "$PROTECTED_UDP_LIST"
-  },
-  "blocked_now": {
-    "syn_flood_v4": $SYN_BAN,
-    "syn_flood_v6": $SYN_BAN_V6,
-    "udp_flood_v4": $UDP_BAN,
-    "crowdsec_bans": $CS_BANS,
-    "scanner_blocklist_v4": $BL_V4,
-    "scanner_blocklist_v6": $BL_V6
-  },
-  "whitelist": {
-    "ssh_key_auto": $CS_WHITE,
-    "manual": $MANUAL_WHITE
-  },
-  "last_blocklist_update": "$LAST_UPDATE"
-}
-JSON
-    exit 0
-fi
-
-# === MODE: ONCE (без интерактива) ===
-if [ "$MODE" = "once" ]; then
-    collect_stats
-    draw_snapshot
-    exit 0
-fi
-
-# === MODE: INTERACTIVE ===
-while true; do
-    collect_stats
-    clear 2>/dev/null
-    draw_snapshot
-    echo -e "${C}──────────────────────────────────────────────────────────────────${N}"
-    echo -e "  [${B}1${N}] syn-flood IPs    [${B}2${N}] crowdsec bans   [${B}3${N}] whitelist IPs"
-    echo -e "  [${B}4${N}] scanner samples  [${B}r${N}] refresh         [${B}0${N}] exit"
-    echo -ne "  > "
-
-    read -r CHOICE
-    case "$CHOICE" in
-        1) show_syn_flood_ips    ;;
-        2) show_crowdsec_bans    ;;
-        3) show_whitelist_ips    ;;
-        4) show_scanner_samples  ;;
-        r|R|"") continue ;;
-        0|q|quit|exit) clear 2>/dev/null; exit 0 ;;
-        *) echo -e "  ${Y}Unknown: $CHOICE${N}" ;;
-    esac
-
-    if [ "$CHOICE" != "r" ] && [ "$CHOICE" != "R" ] && [ "$CHOICE" != "" ]; then
-        echo -ne "  ${DIM}Press Enter to return...${N}"
-        read -r _
-    fi
+# Ждём пока интерфейс полностью поднимется
+for i in 1 2 3 4 5; do
+    [ -d "/sys/class/net/$IFACE" ] && break
+    sleep 1
 done
-GUARD_EOF
 
-chmod 0755 "$GUARD_BIN"
-print_ok "Команда установлена: $GUARD_BIN"
-print_info "Снимок состояния: ${BOLD}sudo guard${NC}  (или ${BOLD}sudo guard --json${NC})"
+# Ring buffers max — ТОЛЬКО на не-virtio драйверах с заметной разницей
+# (избегаем link-flap при каждом ребуте)
+if command -v ethtool >/dev/null 2>&1; then
+    DRIVER=$(ethtool -i "$IFACE" 2>/dev/null | awk '/^driver:/ {print $2}')
+    if [ "$DRIVER" != "virtio_net" ]; then
+        MAX_RX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/^RX:/ && !/Mini|Jumbo/ {print $2; exit}')
+        MAX_TX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/^TX:/ {print $2; exit}')
+        CUR_RX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Current hardware settings/{f=1; next} f && /^RX:/ && !/Mini|Jumbo/ {print $2; exit}')
+        # Применяем только если current < max (порог 4x — меньше не оправдывает link-flap)
+        if [ -n "$MAX_RX" ] && [ "$MAX_RX" != "n/a" ] && [ -n "$CUR_RX" ] && [ "$CUR_RX" != "$MAX_RX" ] && [ "$((MAX_RX / CUR_RX))" -ge 4 ] 2>/dev/null; then
+            ethtool -G "$IFACE" rx "$MAX_RX" tx "$MAX_TX" 2>/dev/null || true
+        fi
+    fi
 
-# ==============================================================================
-# ШАГ 13: HEALTHCHECK
-# ==============================================================================
-
-print_header "ШАГ 13: HEALTHCHECK"
-
-print_info "Жду 5 секунд чтобы парсеры успели прочитать логи..."
-sleep 5
-
-print_status "CrowdSec metrics:"
-echo ""
-# v1.5 fix: head закрывает pipe раньше времени → SIGPIPE → false-negative.
-# Сохраняем в переменную, потом печатаем — без pipe-зависимости.
-METRICS_OUT=$(cscli metrics 2>/dev/null)
-if [ -n "$METRICS_OUT" ]; then
-    echo "$METRICS_OUT" | head -50 | sed 's/^/    /'
-else
-    print_warn "cscli metrics вернул пусто — проверь journalctl -u crowdsec"
-fi
-echo ""
-
-ACTIVE_BANS=$(cscli decisions list --type ban -o raw 2>/dev/null | tail -n +2 | wc -l)
-ACTIVE_WHITELIST=$(cscli decisions list --type whitelist -o raw 2>/dev/null | tail -n +2 | wc -l)
-
-if [ "$ACTIVE_BANS" -gt 0 ]; then
-    print_ok "Активных банов: $ACTIVE_BANS"
-else
-    print_info "Активных банов нет (норма для свежей установки)"
+    # Offloads — безопасно, поддерживаются практически всеми драйверами
+    for off in gro gso tso tx rx; do
+        ethtool -K "$IFACE" "$off" on 2>/dev/null || true
+    done
 fi
 
-if [ "$ACTIVE_WHITELIST" -gt 0 ]; then
-    print_ok "Активных whitelist-decision'ов: $ACTIVE_WHITELIST"
+# GRO flush + napi defer (консервативные значения)
+[ -w "/sys/class/net/$IFACE/gro_flush_timeout" ] && echo 50000 > "/sys/class/net/$IFACE/gro_flush_timeout"
+[ -w "/sys/class/net/$IFACE/napi_defer_hard_irqs" ] && echo 1 > "/sys/class/net/$IFACE/napi_defer_hard_irqs"
+
+# XPS — распределение TX по CPU (только если CPU < 32 для безопасности маски)
+if [ "$CPUS" -gt 1 ] && [ "$CPUS" -lt 32 ]; then
+    for tx_q in /sys/class/net/$IFACE/queues/tx-*; do
+        [ ! -d "$tx_q" ] && continue
+        Q_NUM=$(basename "$tx_q" | sed 's/tx-//')
+        CPU_FOR_Q=$((Q_NUM % CPUS))
+        CPU_MASK=$(printf "%x" $((1 << CPU_FOR_Q)))
+        [ -w "$tx_q/xps_cpus" ] && echo "$CPU_MASK" > "$tx_q/xps_cpus" 2>/dev/null || true
+    done
 fi
 
-# v1.3: scanner blocklist size
-BL_V4=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
-BL_V6=$(nft list set inet ddos_protect scanner_blocklist_v6 2>/dev/null | grep -c ':' || echo 0)
-if [ "$BL_V4" -gt 0 ] || [ "$BL_V6" -gt 0 ]; then
-    print_ok "Scanner blocklist: $BL_V4 v4 / $BL_V6 v6 подсетей"
-else
-    print_warn "Scanner blocklist пуст — проверь journalctl -u scanner-blocklist-update"
+# IRQ affinity — распределяем прерывания NIC по CPU round-robin
+# (без этого все IRQ попадают на CPU0 = бутылочное горлышко)
+if [ "$CPUS" -gt 1 ]; then
+    NIC_IRQS=$(grep -E "(^|[[:space:]])${IFACE}(-|$)" /proc/interrupts 2>/dev/null | awk -F: '{gsub(/ /,"",$1); print $1}')
+    if [ -n "$NIC_IRQS" ]; then
+        IDX=0
+        for irq in $NIC_IRQS; do
+            if [ -w "/proc/irq/$irq/smp_affinity" ]; then
+                CPU_N=$((IDX % CPUS))
+                MASK=$(printf "%x" $((1 << CPU_N)))
+                echo "$MASK" > "/proc/irq/$irq/smp_affinity" 2>/dev/null || true
+            fi
+            IDX=$((IDX + 1))
+        done
+    fi
 fi
 
-# ==============================================================================
-# ШАГ 14: ИТОГИ
-# ==============================================================================
+exit 0
+NICEOF
+        chmod +x /usr/local/sbin/nic-tuning.sh
 
-print_header "ГОТОВО"
+        cat > /etc/systemd/system/nic-tuning.service <<'SVCEOF'
+[Unit]
+Description=NIC Tuning for VPN Node (GRO/XPS/Offloads/Ring Buffers)
+After=network-online.target
+Wants=network-online.target
 
-echo -e "  ${BOLD}Что настроено:${NC}"
-echo -e "  ├─ ${GREEN}✔${NC} nft rate-limit: 60 SYN/sec TCP, 200 packets/sec UDP (CGNAT-friendly)"
-echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Scanner blocklist:${NC} pre-emptive drop известных сканеров"
-echo -e "  │   └─ обновление каждые 6 часов из shadow-netlab/traffic-guard-lists"
-echo -e "  ├─ ${GREEN}✔${NC} Защищённые TCP-порты: ${CYAN}$XRAY_PORTS_TCP${NC}"
-[ -n "$XRAY_PORTS_UDP" ] && echo -e "  ├─ ${GREEN}✔${NC} Защищённые UDP-порты: ${CYAN}$XRAY_PORTS_UDP${NC}"
-echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Auto-sync портов с фаерволом:${NC} мгновенно через inotify + 60с safety"
-echo -e "  │   └─ Открыл порт в UFW → защита подхватит за < 1 секунды"
-echo -e "  ├─ ${GREEN}✔${NC} SSH порт ${CYAN}$SSH_PORT${NC} исключён из rate-limit"
-echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}SSH-key auto-whitelist:${NC} 12h после успешного входа по ключу"
-[ -n "$ADMIN_IP" ] && echo -e "  ├─ ${GREEN}✔${NC} Bootstrap whitelist: ${CYAN}$ADMIN_IP${NC}"
-echo -e "  ├─ ${GREEN}✔${NC} CrowdSec collections: linux + sshd"
-echo -e "  ├─ ${GREEN}✔${NC} ssh-cve-2024-6387 (regreSSHion) активен"
-echo -e "  ├─ ${GREEN}✔${NC} Ban duration: 4h (user-friendly)"
-echo -e "  ├─ ${GREEN}✔${NC} Community blocklist: автообновление каждые 2 часа"
-echo -e "  ├─ ${GREEN}✔${NC} nftables bouncer применяет CrowdSec decisions"
-echo -e "  └─ ${GREEN}✔${NC} ${BOLD}Команда ${CYAN}guard${NC} ${BOLD}— дашборд защиты в реальном времени${NC}"
-echo ""
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nic-tuning.sh
 
-# v1.6: главное приглашение посмотреть статистику
-echo -e "  ${BOLD}${MAGENTA}🛡  Посмотреть статистику защиты:${NC}"
-echo -e "     ${CYAN}sudo guard${NC}    # снимок состояния защиты"
-echo -e "     ${CYAN}sudo guard --json${NC}    # JSON для скриптов"
-echo -e "     ${CYAN}sudo watch -n 5 guard${NC}    # live-режим (через watch)"
-echo ""
+[Install]
+WantedBy=multi-user.target
+SVCEOF
 
-# v1.5: уровень защиты в зависимости от SSH-конфига
-if [ "${SSHD_PASSWORD_AUTH_ENABLED:-0}" = "1" ]; then
-    echo -e "  ${BOLD}${YELLOW}⚠ Уровень защиты: ХОРОШИЙ${NC} (90% максимума)"
-    echo -e "  Сервер защищён от:"
-    echo -e "  ${GREEN}✔${NC} DDoS / SYN-flood / port-scan атак"
-    echo -e "  ${GREEN}✔${NC} Известных сканеров (Shodan/Censys/gov)"
-    echo -e "  ${GREEN}✔${NC} SSH brute-force через CrowdSec"
-    echo -e "  ${GREEN}✔${NC} regreSSHion (CVE-2024-6387)"
+        systemctl daemon-reload
+        systemctl enable nic-tuning.service >/dev/null 2>&1
+        print_ok "Сервис nic-tuning.service создан и включён"
+    fi
+
     echo ""
-    echo -e "  ${BOLD}${YELLOW}Чтобы получить МАКСИМАЛЬНУЮ защиту:${NC}"
-    echo -e "  ${BOLD}1.${NC} На локальной машине сгенерируй SSH-ключ:"
-    echo -e "     ${CYAN}ssh-keygen -t ed25519 -f ~/.ssh/vpn_admin${NC}"
-    echo -e "  ${BOLD}2.${NC} Скопируй публичный ключ на сервер:"
-    echo -e "     ${CYAN}ssh-copy-id -i ~/.ssh/vpn_admin.pub root@$(hostname -I | awk '{print $1}')${NC}"
-    echo -e "  ${BOLD}3.${NC} Проверь что заходит без пароля:"
-    echo -e "     ${CYAN}ssh -i ~/.ssh/vpn_admin root@$(hostname -I | awk '{print $1}')${NC}"
-    echo -e "  ${BOLD}4.${NC} ${BOLD}Только после успешной проверки${NC} — отключи пароль:"
-    echo -e "     ${CYAN}sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config${NC}"
-    echo -e "     ${CYAN}sed -i 's/^[#[:space:]]*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config${NC}"
-    echo -e "     ${CYAN}sshd -t && systemctl reload ssh${NC}"
-    echo ""
-else
-    echo -e "  ${BOLD}${GREEN}✔ Уровень защиты: МАКСИМАЛЬНЫЙ${NC}"
-    echo -e "  Password-auth выключен, защита SSH работает на полную"
-    echo ""
+    print_info "Применённые NIC бусты:"
+    if [ ${#NIC_BOOSTS_APPLIED[@]} -eq 0 ]; then
+        echo -e "    ${YELLOW}(ничего — драйвер/виртуализация не поддерживает)${NC}"
+        NIC_BOOSTS_SUMMARY="none (driver limit)"
+    else
+        for b in "${NIC_BOOSTS_APPLIED[@]}"; do
+            echo -e "    ${GREEN}✔${NC} $b"
+        done
+        NIC_BOOSTS_SUMMARY="${#NIC_BOOSTS_APPLIED[@]} boost(s)"
+    fi
 fi
 
-echo -e "  ${BOLD}Многоуровневая защита (по приоритету):${NC}"
-echo -e "  1. ${CYAN}Manual whitelist${NC}      → твои runtime-добавленные IP"
-echo -e "  2. ${CYAN}SSH (порт $SSH_PORT)${NC}      → пропуск (защищает CrowdSec)"
-echo -e "  3. ${CYAN}Scanner blocklist${NC}     → drop известных сканеров (Shodan, Censys, gov)"
-echo -e "  4. ${CYAN}SYN-flood rate-limit${NC}  → 60/sec burst 100 на Xray (CGNAT-friendly)"
-echo -e "  5. ${CYAN}CrowdSec bouncer${NC}      → бан по поведению (SSH brute-force only)"
+# ==============================================================================
+# ШАГ 8: НАСТРОЙКА ЛИМИТОВ (ULIMIT)
+# ==============================================================================
+
+print_header "ШАГ 8: НАСТРОЙКА ЛИМИТОВ (ULIMIT)"
+
+print_status "Определяем лимиты файловых дескрипторов..."
+
+if [ "$TOTAL_MEM_MB" -le 1200 ]; then
+    LIMIT_COUNT=65535
+    LIMIT_REASON="(ограничено из-за 1GB RAM)"
+else
+    LIMIT_COUNT=500000
+    LIMIT_REASON="(стандартный для VPN-ноды)"
+fi
+
+echo -e "    Лимит: ${GREEN}$LIMIT_COUNT${NC} $LIMIT_REASON"
 echo ""
-echo -e "  ${BOLD}${GREEN}User-friendly defaults:${NC}"
-echo -e "  ${GREEN}✔${NC} Юзеры за CGNAT (мобильные операторы) не банятся — лимит 60/sec"
-echo -e "  ${GREEN}✔${NC} Профили с несколькими Xray-портами не банятся как 'port-scan'"
-echo -e "  ${GREEN}✔${NC} Ложные баны живут 4h вместо 24h"
-echo -e "  ${GREEN}✔${NC} Юзеры из подсетей в blocklist (~0.007% всего IPv4) — это"
-echo -e "      реальные госсканеры/Shodan/Censys, не домашние пользователи"
+
+print_status "Создаём /etc/security/limits.d/xray-limits.conf..."
+cat > /etc/security/limits.d/xray-limits.conf <<EOF
+# XRAY/VPN Limits - Auto-generated
+* soft nofile $LIMIT_COUNT
+* hard nofile $LIMIT_COUNT
+root soft nofile $LIMIT_COUNT
+root hard nofile $LIMIT_COUNT
+EOF
+print_ok "Лимиты пользователей настроены"
+
+print_status "Настраиваем глобальный лимит systemd..."
+mkdir -p /etc/systemd/system.conf.d
+cat > /etc/systemd/system.conf.d/limits.conf <<EOF
+[Manager]
+DefaultLimitNOFILE=$LIMIT_COUNT
+EOF
+print_ok "Systemd лимиты настроены"
+
+print_status "Перезагружаем systemd daemon..."
+systemctl daemon-reexec
+print_ok "Systemd перезагружен"
+
+# ==============================================================================
+# ШАГ 9: ИТОГОВЫЙ ОТЧЁТ
+# ==============================================================================
+
+print_header "УСТАНОВКА ЗАВЕРШЕНА"
+
+echo -e "${GREEN}"
+echo "  ╔═══════════════════════════════════════════════════════════════════╗"
+echo "  ║                    ✅ ВСЁ ГОТОВО!                                 ║"
+echo "  ╚═══════════════════════════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+echo -e "  ${BOLD}Сводка установки:${NC}"
 echo ""
-echo -e "  ${BOLD}Как работает auto-whitelist:${NC}"
-echo -e "  1. Заходишь по SSH с приватным ключом с ЛЮБОГО IP"
-echo -e "  2. ${CYAN}cs-ssh-whitelist${NC} ловит \"Accepted publickey\" в журнале"
-echo -e "  3. ${CYAN}cscli decisions add --type whitelist --duration 12h${NC}"
-echo -e "  4. Этот IP игнорирует все CrowdSec-баны (свои + community) на 12h"
-echo -e "  5. IP сменился → новый заход по ключу → новый whitelist"
-echo -e "  ${MAGENTA}ℹ${NC} Безопасно даже при включённом password-auth: ловится ТОЛЬКО"
-echo -e "     'Accepted publickey'. Юзер с подобранным паролем НЕ попадёт в whitelist."
+echo -e "  ┌─────────────────────────────────────────────────────────────────┐"
+echo -e "  │ ${BOLD}Компонент${NC}              │ ${BOLD}Значение${NC}                            │"
+echo -e "  ├─────────────────────────────────────────────────────────────────┤"
+echo -e "  │ Ядро                   │ ${GREEN}$KERNEL_PKG${NC}               │"
+echo -e "  │ CPU Level              │ ${GREEN}x86-64-v${CPU_LEVEL}${NC}                           │"
+echo -e "  │ Профиль памяти         │ ${PROFILE_COLOR}$PROFILE_NAME${NC}                │"
+echo -e "  │ RAM                    │ ${GREEN}${TOTAL_MEM_MB} MB${NC}                            │"
+echo -e "  │ Лимит nofile           │ ${GREEN}$LIMIT_COUNT${NC}                          │"
+echo -e "  │ TCP Congestion         │ ${GREEN}BBRv3${NC}                               │"
+echo -e "  │ Qdisc                  │ ${GREEN}${QDISC_MODE:-fq}${NC}                     │"
+echo -e "  │ RPS                    │ ${GREEN}${RPS_MODE:-disabled}${NC}                 │"
+echo -e "  │ NIC Boosts             │ ${GREEN}${NIC_BOOSTS_SUMMARY:-none}${NC}            │"
+echo -e "  │ IRQ Affinity           │ ${GREEN}${IRQ_AFFINITY_MODE:-skipped}${NC}         │"
+echo -e "  │ IPv6                   │ ${GREEN}отключён через sysctl${NC}              │"
+echo -e "  └─────────────────────────────────────────────────────────────────┘"
 echo ""
-echo -e "  ${BOLD}Полезные команды:${NC}"
-echo -e "  ${CYAN}cscli decisions list --type whitelist${NC}              # текущие whitelist'ы"
-echo -e "  ${CYAN}cscli decisions list --type ban${NC}                    # активные баны"
-echo -e "  ${CYAN}journalctl -u cs-ssh-whitelist -f${NC}                  # логи SSH-watcher'а"
-echo -e "  ${CYAN}journalctl -u scanner-blocklist-update${NC}             # логи blocklist updater"
-echo -e "  ${CYAN}systemctl list-timers scanner-blocklist-update${NC}     # когда след. обновление"
-echo -e "  ${CYAN}journalctl -t protected-ports${NC}                       # логи синхронизации портов"
-echo -e "  ${CYAN}systemctl status protected-ports-update.path${NC}        # статус inotify-watcher'а"
-echo -e "  ${CYAN}cscli metrics${NC}                                      # статистика парсеров"
-echo -e "  ${CYAN}nft list set inet ddos_protect syn_flood_v4${NC}        # SYN-флуд бан-сет"
-echo -e "  ${CYAN}nft list set inet ddos_protect scanner_blocklist_v4 | wc -l${NC}  # размер blocklist"
+
+echo -e "  ${BOLD}Что было сделано:${NC}"
+echo -e "  ├─ ${GREEN}✔${NC} Бэкап старых конфигов: ${CYAN}${BACKUP_DIR}${NC}"
+echo -e "  ├─ ${GREEN}✔${NC} Удалены apport, whoopsie, ubuntu-report, popularity-contest"
+echo -e "  ├─ ${GREEN}✔${NC} cloud-init и snapd НЕ тронуты (защита SSH-ключей)"
+echo -e "  ├─ ${GREEN}✔${NC} Отключены ModemManager, fwupd, udisks2, multipathd, unattended-upgrades"
+echo -e "  ├─ ${GREEN}✔${NC} Ограничены логи journald (100MB)"
+echo -e "  ├─ ${GREEN}✔${NC} Установлено ядро XanMod с BBRv3 (старое ядро как fallback)"
+echo -e "  ├─ ${GREEN}✔${NC} IPv6 отключён через sysctl (модуль остался, трафик не работает)"
+echo -e "  ├─ ${GREEN}✔${NC} Настроен conntrack (262144, короткие таймауты)"
+echo -e "  ├─ ${GREEN}✔${NC} Оптимизирован сетевой стек (tw_reuse, MTU probing, notsent_lowat)"
+echo -e "  ├─ ${GREEN}✔${NC} Hardening (rp_filter, no redirects)"
+echo -e "  ├─ ${GREEN}✔${NC} Настроены лимиты (nofile $LIMIT_COUNT)"
+echo -e "  ├─ ${GREEN}✔${NC} Qdisc + RPS настроены под топологию железа"
+echo -e "  ├─ ${GREEN}✔${NC} NIC бусты: GRO flush, XPS, offloads, ring buffers"
+echo -e "  ├─ ${GREEN}✔${NC} IRQ affinity распределён по CPU (round-robin)"
+echo -e "  └─ ${GREEN}✔${NC} Inotify limits увеличены (для 10k+ соединений)"
 echo ""
-echo -e "  ${BOLD}Принудительное обновление blocklist:${NC}"
-echo -e "  ${CYAN}systemctl start scanner-blocklist-update.service${NC}"
+echo -e "  ${BOLD}Что НЕ было тронуто (минимизация рисков v4.10):${NC}"
+echo -e "  ├─ ${MAGENTA}✗${NC} netplan (никаких accept-ra, link-local, новых файлов)"
+echo -e "  ├─ ${MAGENTA}✗${NC} cloud-init (защита SSH-ключей)"
+echo -e "  ├─ ${MAGENTA}✗${NC} GRUB cmdline (никаких ipv6.disable=1, etc)"
+echo -e "  ├─ ${MAGENTA}✗${NC} systemd-networkd-wait-online (никаких override)"
+echo -e "  ├─ ${MAGENTA}✗${NC} /etc/network/interfaces, ifupdown"
+echo -e "  ├─ ${MAGENTA}✗${NC} /etc/fstab (только warning при дублях)"
+echo -e "  └─ ${MAGENTA}✗${NC} UFW правила (только warning об активности)"
 echo ""
-echo -e "  ${BOLD}Если потерял доступ и забанен:${NC}"
-echo -e "  Зайти через консоль провайдера (KVM/VNC) и:"
-echo -e "  ${CYAN}cscli decisions delete --ip <твой_IP>${NC}"
-echo -e "  ${CYAN}nft add element inet ddos_protect manual_whitelist_v4 { <твой_IP> }${NC}"
+
+echo -e "  ${BOLD}Файлы конфигурации:${NC}"
+echo -e "  ├─ ${CYAN}/etc/sysctl.d/99-xray-tuning.conf${NC}"
+echo -e "  ├─ ${CYAN}/etc/sysctl.d/99-disable-ipv6.conf${NC}"
+echo -e "  ├─ ${CYAN}/etc/sysctl.d/99-conntrack.conf${NC}"
+echo -e "  ├─ ${CYAN}/etc/modprobe.d/conntrack.conf${NC}"
+echo -e "  ├─ ${CYAN}/etc/security/limits.d/xray-limits.conf${NC}"
+echo -e "  ├─ ${CYAN}/etc/systemd/system.conf.d/limits.conf${NC}"
+echo -e "  ├─ ${CYAN}/etc/systemd/journald.conf.d/size-limit.conf${NC}"
+echo -e "  ├─ ${CYAN}/usr/local/sbin/rps-tuning.sh${NC}"
+echo -e "  ├─ ${CYAN}/etc/systemd/system/rps-tuning.service${NC}"
+echo -e "  ├─ ${CYAN}/usr/local/sbin/nic-tuning.sh${NC}"
+echo -e "  └─ ${CYAN}/etc/systemd/system/nic-tuning.service${NC}"
 echo ""
-echo -e "  ${BOLD}Бэкап:${NC} ${CYAN}$BACKUP_DIR${NC}"
+echo -e "  ${BOLD}Бэкап старых конфигов:${NC}"
+echo -e "  └─ ${CYAN}${BACKUP_DIR}${NC}"
 echo ""
-# v1.5 fix: при запуске через pipe (curl ... | bash) или process substitution
-# $0 может быть /dev/fd/63 — некрасиво в выводе. Используем имя файла
-# скрипта если оно валидное, иначе показываем generic-команду.
-SCRIPT_NAME="$0"
-case "$SCRIPT_NAME" in
-    /dev/fd/*|/proc/*|bash|-bash|sh|-sh)
-        SCRIPT_NAME="vpn-node-ddos-protect-v1_5.sh"
-        ;;
-esac
-echo -e "  ${BOLD}Удалить всё:${NC} ${CYAN}sudo bash $SCRIPT_NAME --uninstall${NC}"
+
+echo -e "  ${YELLOW}⚠️  ВАЖНО: Для активации ядра XanMod требуется перезагрузка!${NC}"
 echo ""
+
+echo -e "${RED}"
+echo "  ╔═══════════════════════════════════════════════════════════════════╗"
+echo "  ║                     🔄 ТРЕБУЕТСЯ REBOOT                           ║"
+echo "  ╚═══════════════════════════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+echo -e "  ${BOLD}После перезагрузки проверьте:${NC}"
+echo -e "  ${CYAN}uname -r${NC}                                    # Должно показать xanmod"
+echo -e "  ${CYAN}sysctl net.ipv4.tcp_congestion_control${NC}      # Должно быть bbr"
+echo -e "  ${CYAN}sysctl net.core.default_qdisc${NC}               # Должно быть fq"
+echo -e "  ${CYAN}tc qdisc show dev \$(ip route|awk '/default/{print \$5;exit}')${NC}  # mq+fq или fq"
+echo -e "  ${CYAN}cat /sys/class/net/\$(ip route|awk '/default/{print \$5;exit}')/queues/rx-0/rps_cpus${NC}  # RPS mask"
+echo -e "  ${CYAN}sysctl net.netfilter.nf_conntrack_max${NC}       # Должно быть 262144"
+echo -e "  ${CYAN}cat /proc/sys/net/ipv4/tcp_tw_reuse${NC}         # Должно быть 1"
+echo -e "  ${CYAN}sysctl net.ipv6.conf.all.disable_ipv6${NC}       # Должно быть 1"
+echo -e "  ${CYAN}grep \$(ip route|awk '/default/{print \$5;exit}') /proc/interrupts | head -5${NC}  # IRQ распределение"
+echo -e "  ${CYAN}cat /proc/sys/fs/inotify/max_user_watches${NC}   # Должно быть 524288"
+echo -e "  ${CYAN}systemctl --failed${NC}                          # Не должно быть failed-сервисов"
+echo ""
+
+read -p "  Перезагрузить сервер сейчас? (y/n): " -n 1 -r < /dev/tty
+echo ""
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo ""
+    echo -e "  ${GREEN}Перезагрузка через 3 секунды...${NC}"
+    sleep 3
+    reboot
+else
+    echo ""
+    echo -e "  ${YELLOW}Не забудьте перезагрузить сервер позже!${NC}"
+    echo -e "  ${CYAN}sudo reboot${NC}"
+    echo ""
+fi
