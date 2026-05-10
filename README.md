@@ -126,6 +126,9 @@ systemctl status rps-tuning.service nic-tuning.service mss-clamp.service --no-pa
 
 ## Версии
 
+- **v5.0.2** — hotfix для копирования команды после диагностики:
+  - **Bugfix**: после `--diagnose` команда `sudo bash <(curl ...) --optimize` обрезалась в терминалах/Telegram (длинная) и работала только в bash. Клиенты копировали кусок → "файл не найден"
+  - **Fix**: `installed.sh` теперь сохраняется **рано** (до диагностики/TUI), после первого запуска всегда доступен короткий путь `/var/lib/vpn-node-builder/installed.sh`. Сообщение после diagnose показывает короткую команду как основную
 - **v5.0.1** — hotfix для конфликтов с node-diagnostic:
   - **Bugfix**: detect + cleanup `/etc/sysctl.d/99-vpn-tuning.conf` от node-diagnostic с `-a` (содержит опасные `tcp_fastopen=3`, `somaxconn=8192`). Backup в `/var/lib/vpn-node-builder/snapshots/sysctl-cleanup-*/`
   - **Change**: КОНСОЛИДАЦИЯ — все наши sysctl-настройки теперь в одном файле `/etc/sysctl.d/99-vpn-node-tuning.conf` (раньше было два: `99-conntrack.conf` + `99-xray-tuning.conf`). Старые файлы удаляются автоматически
