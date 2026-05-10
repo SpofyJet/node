@@ -1,144 +1,155 @@
 # vpn-node-setup
 
-Bash-скрипт оптимизации VPN-нод (Xray / Reality / Hysteria2 / sing-box / Remnawave / Marzban). Целевые ОС: Debian 12/13, Ubuntu 22.04/24.04.
+Универсальный bash-скрипт для VPN-нод (Xray / Reality / Hysteria2 / sing-box / Remnawave / Marzban): **оптимизация + диагностика**. Целевые ОС: Debian 12/13, Ubuntu 22.04/24.04.
 
-Стек: **XanMod LTS kernel + BBRv3 + nftables + sysctl tuning + NIC бусты**.
+Стек: **XanMod LTS kernel + BBRv3 + nftables (MSS clamp) + sysctl tuning + NIC бусты + диагностика через node-diagnostic**.
+
+## Что нового в v5.0
+
+- **TUI меню при запуске**: выбор между оптимизацией и диагностикой
+- **MSS clamp через nftables** — решает проблему "потолка ~580-630 пользователей на ноду" (клиенты с нестандартным PMTU не могли установить TCP)
+- **Tier-aware conntrack_max** — на больших нодах (8GB+) поднят до 1M записей
+- **Диагностика через [node-diagnostic](https://github.com/Case211/node-diagnostic) от Case211** — 23 проверки → Score 0-100 (скачивается с github)
+- **Совместимость с [shieldnode](https://github.com/abcproxy70-ops/shield)** проверена: отдельная таблица nft, не пересекается
 
 ## Возможности
 
 - **XanMod LTS kernel** с BBRv3 (auto-detect x86-64-v1/v2/v3 уровня CPU)
-  - Idempotency: если LTS уже установлен — шаг пропускается
-  - Detection ранее установленного MAIN-ядра — параллельная установка LTS + warning оператору
-- **TCP-стек**: BBR congestion control, fq qdisc, `tcp_notsent_lowat=131072` (anti-bufferbloat)
-- **Conntrack**: `nf_conntrack_max=262144`, hashsize=65536, TCP timeouts оптимизированы под Xray
-  - UDP timeouts намеренно НЕ выставляются — управляются shieldnode (если установлен)
-- **TIER-aware sysctl** по объёму RAM (1GB / 2GB / 4-8GB / 8GB+):
-  - TIER 1 (1GB): rmem_max 4MB, overcommit_memory=1, swappiness=20
-  - TIER 2 (2GB): rmem_max 16MB
-  - TIER 3 (4-8GB): rmem_max 16MB, tcp_adv_win_scale=-2
-  - TIER 4 (8GB+): rmem_max 33MB, netdev_max_backlog=32768
-- **IPv6 disable** через GRUB cmdline + sysctl fallback (для VPN-нод обычно не нужен)
-- **Qdisc multi-queue (mq+fq)** для multi-CPU нод (single-queue → fq fallback)
-- **RPS** (Receive Packet Steering) с авто-detect: skip если HW multi-queue ≥ CPUs
-- **NIC бусты**: ethtool offloads (GRO/GSO/TSO), GRO flush 50µs + napi_defer, XPS, ring buffers max
-- **txqueuelen=10000** для основного интерфейса (защита от TX-drops при пиках на virtio)
-- **IRQ affinity** round-robin по CPU (+ irqbalance integration через BANNED_INTERRUPTS)
-- **Pre-flight checks**: dpkg integrity, GRUB_TIMEOUT, VMware/Hyper-V detect, fstab дубли, netplan валидация
-- **Self-upgrade flow**: команды `--check` / `--upgrade` / `--rollback` / `--diff` (см. ниже)
-- **--dry-run** mode: пробежать все pre-flight без apt install ядра
+- **TCP-стек**: BBR congestion control, fq qdisc, `tcp_notsent_lowat=131072`
+- **MSS clamp** через nftables (priority -150 на forward+output) — для FORWARD-трафика клиентов с PMTU<1500
+- **Conntrack tier-aware** по объёму RAM:
+  - TIER 1 (≤1.2GB): max=262144, hashsize=65536
+  - TIER 2 (≤2.5GB): max=524288, hashsize=131072
+  - TIER 3 (≤8.5GB): max=1048576, hashsize=262144
+  - TIER 4 (>8.5GB): max=1048576, hashsize=262144
+- **TIER-aware sysctl** по RAM (rmem_max от 4MB до 32MB по тиру)
+- **IPv6 disable** через GRUB cmdline + sysctl fallback
+- **Qdisc multi-queue (mq+fq)** для multi-CPU нод
+- **RPS** с авто-detect: skip если HW multi-queue ≥ CPUs
+- **NIC бусты**: ethtool offloads, GRO flush, XPS, ring buffers max, txqueuelen=10000
+- **IRQ affinity** round-robin + irqbalance integration
+- **Pre-flight checks**: dpkg, GRUB_TIMEOUT, VMware/Hyper-V, fstab, netplan
+- **Self-upgrade**: `--check` / `--upgrade` / `--rollback` / `--diff`
+- **Диагностика** через скачивание свежего `node-diagnostic.sh` (4 sanity-check'а)
+- **--dry-run** mode
 
 ## Установка
 
+### С TUI меню (рекомендуется)
+
 ```bash
-sudo bash <(curl -sL https://raw.githubusercontent.com/abcproxy70-ops/node/main/vpn-node-setup.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/abcproxy70-ops/node/main/vpn-node-setup.sh)
 ```
 
-Скрипт сам:
-- определит дистрибутив (Debian/Ubuntu) и CPU level
-- установит XanMod LTS kernel (если ещё нет)
-- настроит sysctl, qdisc, conntrack, лимиты
-- создаст `rps-tuning.service` и `nic-tuning.service` (persistent через reboot)
-- сохранит снимок настроек в `/root/vpn-node-builder-backup-YYYYMMDD-HHMMSS/`
+### Прямой запуск (CI / ansible)
+
+```bash
+sudo bash vpn-node-setup.sh --optimize    # оптимизация без меню
+sudo bash vpn-node-setup.sh --diagnose    # диагностика без меню
+```
+
+### Что делает скрипт при оптимизации
+
+- Определит дистрибутив и CPU level
+- Установит XanMod LTS kernel (если ещё нет)
+- Установит nftables (если отсутствует)
+- Настроит sysctl (tier-aware), qdisc, conntrack, MSS clamp, лимиты
+- Создаст `rps-tuning.service`, `nic-tuning.service`, `mss-clamp.service`
+- Снимок настроек в `/root/vpn-node-builder-backup-YYYYMMDD-HHMMSS/`
 
 После завершения — обязательный `reboot` для активации нового ядра.
 
 ## Self-upgrade
 
-После первой установки скрипт сохраняется в `/var/lib/vpn-node-builder/installed.sh` и доступен через локальный путь:
-
 ```bash
-# Проверить новую версию на github (без sudo)
-sudo /var/lib/vpn-node-builder/installed.sh --check
-
-# Показать diff между текущей и upstream версией
-/var/lib/vpn-node-builder/installed.sh --diff
-
-# Безопасный upgrade: sanity-check + snapshot настроек + запуск новой версии
-sudo /var/lib/vpn-node-builder/installed.sh --upgrade
-
-# Откатиться к предыдущей версии (если что-то пошло не так)
-sudo /var/lib/vpn-node-builder/installed.sh --rollback
-
-# Версия скрипта
-/var/lib/vpn-node-builder/installed.sh --version
+sudo /var/lib/vpn-node-builder/installed.sh --check       # проверить новую версию
+sudo /var/lib/vpn-node-builder/installed.sh --upgrade     # безопасный upgrade
+sudo /var/lib/vpn-node-builder/installed.sh --rollback    # откат
+sudo /var/lib/vpn-node-builder/installed.sh --diagnose    # диагностика
 ```
 
-`--upgrade` делает 5 проверок перед запуском: непустой файл, shebang, не HTML (cloudflare-error-page), version marker, `bash -n` syntax. И snapshot текущих `/etc/sysctl.d/`, `/etc/security/limits.d/`, `rps-tuning.service`, `nic-tuning.service` в `/var/lib/vpn-node-builder/snapshots/` — для возможного `--rollback`.
-
-## Конфигурация
-
-Скрипт работает без конфиг-файла — всё авто-detect'ится.
-
-Repo URL для self-upgrade переопределяется через env:
-
-```bash
-SCRIPT_REPO_URL="https://my-fork/vpn-node-setup.sh" sudo /var/lib/vpn-node-builder/installed.sh --check
-```
+`--upgrade` делает 5 проверок перед запуском: непустой, shebang, не HTML, version marker, `bash -n`. Snapshot настроек сохраняется в `/var/lib/vpn-node-builder/snapshots/`.
 
 ## Параметры запуска
 
 ```
 sudo bash vpn-node-setup.sh [OPTIONS]
 
+  (без аргументов, TTY)     TUI меню
+  (без аргументов, non-TTY) Оптимизация (backward compat для CI)
+
+  --optimize       Прямая оптимизация без TUI
+  --diagnose       Прямая диагностика (node-diagnostic от Case211)
   --dry-run, -n    Показать что будет, без apt install ядра
   --version, -V    Версия скрипта
   --check          Проверить новую версию на github
-  --diff           Diff между установленной и upstream версией (использует $PAGER)
+  --diff           Diff между установленной и upstream
   --upgrade        Безопасный upgrade с sanity-check + snapshot
   --rollback       Откатиться к предыдущей версии
-  --help, -h       Показать help
+  --help, -h       Help
 ```
 
 ## Совместимость с shieldnode
 
-Скрипт спроектирован совместимо с [shieldnode](https://github.com/abcproxy70-ops/shield) DDoS-защитой:
-- UDP conntrack timeouts (`nf_conntrack_udp_timeout`, `_stream`) **НЕ** перетираются — отдаются shieldnode (180/300 для VPN keepalive)
-- TIER 1/2 rmem_max подняты под Hysteria2 BBR throughput (4MB / 16MB)
-- IPv6 отключение делается через GRUB cmdline + sysctl — shieldnode видит это и не пытается ставить IPv6 правила
+Скрипт спроектирован совместимо с [shieldnode](https://github.com/abcproxy70-ops/shield):
+
+- **UDP conntrack timeouts** не перетираются — отдаются shieldnode (180/300 для VPN keepalive)
+- **MSS clamp** в отдельной nft-таблице `inet vpn_node_mss_clamp` — не пересекается с shieldnode'овскими (`inet ddos_protect`, `inet filter`, `ip/ip6 crowdsec`)
+- Forward priority -150 безопасен: shieldnode на forward использует -50 или filter=0, не -150
+- TIER 1/2 rmem_max подняты под Hysteria2 BBR throughput
+- IPv6 отключение через GRUB cmdline — shieldnode видит и не ставит IPv6 правила
+
+## Что НЕ делает скрипт (намеренно)
+
+- Не устанавливает Xray / sing-box / Hysteria — задача панели
+- Не настраивает SSH / firewall — задача shieldnode / UFW
+- Не трогает netplan и `/etc/network/interfaces` без необходимости
+- Не удаляет cloud-init
+- Не использует агрессивные настройки от node-diagnostic:
+  - `tcp_fastopen=3` (сломает Xray Reality)
+  - `somaxconn=8192` / `tcp_max_syn_backlog=8192` (деградация в 8 раз vs наши 65535)
+  - `rmem_max=64MB` (опасно для 1GB ноды)
+  - `default_qdisc=cake` (опционально через TUI меню для проблемных пирингов)
 
 ## Проверка после reboot
 
 ```bash
-uname -r                                      # должно содержать 'lts' и 'xanmod'
-sysctl net.ipv4.tcp_congestion_control        # bbr
-sysctl net.core.default_qdisc                 # fq
-sysctl net.netfilter.nf_conntrack_max         # 262144
-sysctl net.core.rmem_max                      # для 1GB: 4194304, для 2GB: 16777216
+uname -r                                                              # 'lts' и 'xanmod'
+sysctl net.ipv4.tcp_congestion_control                                # bbr
+sysctl net.core.default_qdisc                                         # fq
+sysctl net.netfilter.nf_conntrack_max                                 # tier-aware
+sysctl net.core.rmem_max                                              # tier-aware
 ip link show $(ip route|awk '/default/{print $5;exit}') | grep qlen   # qlen 10000
-systemctl status rps-tuning.service nic-tuning.service --no-pager     # active (exited)
+nft list table inet vpn_node_mss_clamp                                # MSS clamp правила
+systemctl status rps-tuning.service nic-tuning.service mss-clamp.service --no-pager
 ```
 
 ## Версии
 
-- **v4.13** — CRITICAL FIXES для совместимости с shieldnode + Hysteria2:
-  - **CRIT-1**: убраны `nf_conntrack_udp_timeout=120` / `_stream=180` из `99-conntrack.conf` и live sysctl. Раньше setup перетирал shieldnode'овские 180/300 (лексикографический порядок sysctl-d 99 > 90), Hysteria2 keepalive рвался у мобильных
-  - **CRIT-2**: TIER 1 rmem_max 2MB → 4MB, TIER 2 8MB → 16MB. Hysteria2 (UDP+BBR) требует ≥ 4-16MB чтобы выйти на потолок throughput
-  - **Add**: `vm.overcommit_memory=1` на TIER 1 — защита от OOM на 1GB ноде
-  - **Add**: `txqueuelen=10000` для основного интерфейса (default 1000 — узкое горлышко на virtio при пиках)
-  - **Add**: SELF-UPGRADE FLOW — `--check` / `--upgrade` / `--rollback` / `--diff` с sanity-check (5 проверок) и snapshot настроек
-- **v4.12** — переход с XanMod MAIN на LTS branch (production-ready kernel, меньше регрессий, поддержка x86-64-v1, idempotency, `--dry-run` флаг)
-- **v4.11** — защита от dpkg-lock конфликта с unattended-upgrades (детектит другой apt-процесс, ждёт до 5 мин)
-- **v4.10** — РАДИКАЛЬНОЕ УПРОЩЕНИЕ после реальных поломок на проде:
-  - Удалена pre-flight защита по сети, IPv6 disable через GRUB cmdline (трогало boot), детект cloud-провайдера, удаление cloud-init/snapd
-  - Оставлены только safe-оптимизации: kernel + BBR + sysctl + qdisc + RPS + NIC бусты + ulimit + journald
-- **v4.9** — фикс reboot-проблем на KVM с virtio_net: `systemd-networkd-wait-online`, дедуп `/etc/fstab`, нейтрализация `/etc/netplan/00-installer-config.yaml`, отключение `/etc/network/interfaces` при наличии netplan
-- **v4.8** — полировка после реальных запусков: `systemd-networkd-wait-online` override, точная проверка ipv6 модуля в post-reboot инструкциях, проверка `systemctl --failed`
-- **v4.7** — расширенные защиты от поломок ребута: dpkg integrity check, GRUB_TIMEOUT минимум 2 сек, VMware/Hyper-V предупреждение, UFW info, post-install validation НОВОГО ядра ДО `update-grub`, `nf_conntrack` autoload через `modules-load.d`
-- **v4.6** — pre-flight проверки сети и fstab: netplan валидация, отключение `networking.service` (ifupdown) при конфликте, удаление дублей `/etc/fstab`, очистка zombie cloud-init состояния
-- **v4.5** — убран GPG fingerprint verification (XanMod ротирует ключи)
-- **v4.4** — IPv6 disable через GRUB cmdline (`ipv6.disable=1`) с автоматическим бэкапом `/etc/default/grub`, парсинг `GRUB_CMDLINE_LINUX_DEFAULT`, gai.conf precedence для IPv4
-- **v4.3** — IRQ affinity round-robin (критично для 10G и multi-queue NIC), irqbalance integration через `IRQBALANCE_BANNED_INTERRUPTS`, `fs.inotify.max_user_watches=524288`
-- **v4.2** — safety fixes: GPG fingerprint verification XanMod, GRUB обновляется только если grub-pc/grub-efi установлен (не systemd-boot), `sysctl --system` заменён на явный список файлов, journald restart через reload, ring buffers только при 4x+ выгоде, `swappiness=10` во все профили, `vm.min_free_kbytes`, `tcp_timestamps` явно зафиксирован
-- **v4.1** — базовые бусты: `notsent_lowat`, GRO flush, ethtool offloads, ring buffers, XPS, cloud-init detection (Hetzner/DO/Vultr/AWS), убран `tcp_fastopen=3` (конфликт с Xray Reality), hashsize мягко (без лагов), qdisc через add/change вместо replace, hex-индексация mq для 16+ очередей
-
-## Что НЕ делает скрипт (намеренно)
-
-- Не устанавливает Xray / sing-box / Hysteria — это отдельная задача панели (Remnawave / Marzban / 3x-ui)
-- Не настраивает SSH / firewall — это shieldnode / UFW
-- Не трогает `/etc/network/interfaces` если активен netplan (с v4.9)
-- Не удаляет cloud-init (с v4.10) — может зависеть SSH ключ Hetzner / DO
-- Не агрессивный `netdev_budget=600` — может вызывать softirq starvation на 1-2 vCPU нодах (default 300 безопаснее)
-- Не агрессивный `rmem_max=64MB` — может вызвать OOM на 1GB ноде (200 sockets × 64MB = 12GB worst-case)
+- **v5.0** — universal script (оптимизация + диагностика):
+  - **Add**: TUI меню при запуске (UTF-8 + ASCII fallback)
+  - **Add**: ШАГ 7.8 MSS clamp через nftables — решает "потолок 580-630 юзеров"
+  - **Change**: ШАГ 6 conntrack tier-aware (262144 → 1048576 для больших нод)
+  - **Add**: `--optimize` / `--diagnose` CLI флаги
+  - **Add**: режим диагностики через скачивание node-diagnostic от Case211
+  - **Add**: pre-flight install nftables
+- **v4.13** — CRIT fixes для совместимости с shieldnode + Hysteria2:
+  - убраны UDP conntrack timeouts (отдаются shieldnode)
+  - TIER 1 rmem_max 2MB → 4MB, TIER 2 8MB → 16MB
+  - `vm.overcommit_memory=1` на TIER 1, `txqueuelen=10000`
+  - SELF-UPGRADE FLOW (`--check`, `--upgrade`, `--rollback`, `--diff`)
+- **v4.12** — переход с XanMod MAIN на LTS branch
+- **v4.11** — защита от dpkg-lock с unattended-upgrades
+- **v4.10** — упрощение после реальных поломок
+- **v4.9** — фикс reboot-проблем на KVM с virtio_net
+- **v4.8** — полировка после запусков
+- **v4.7** — pre-flight защита от поломок ребута
+- **v4.6** — pre-flight проверки сети и fstab
+- **v4.5** — убран GPG fingerprint verification
+- **v4.4** — IPv6 disable через GRUB cmdline
+- **v4.3** — IRQ affinity + irqbalance
+- **v4.2** — safety fixes
+- **v4.1** — базовые бусты (notsent_lowat, GRO, ethtool, XPS)
 
 ## Лицензия
 
