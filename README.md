@@ -126,6 +126,11 @@ systemctl status rps-tuning.service nic-tuning.service mss-clamp.service --no-pa
 
 ## Версии
 
+- **v5.0.3** — HEADLINE FIX: потолок 580-630 юзеров finally solved:
+  - **Add**: `net.ipv4.tcp_fastopen = 3` по умолчанию. Клиенты упирались в потолок ~550-630 юзеров на ноду — новые подключения "пропадали", существующие держались. CPU/RAM/conntrack были не bottleneck. Тест на двух нодах показал: единственная разница между нодой держащей 600+ и нодой застрявшей на ~550 — это TFO=3
+  - **Mechanism**: TFO=3 экономит 1 RTT на TLS handshake → быстрее переход из half-open в established → выше пропускная способность по числу новых connections per second на пиках
+  - **Note**: бывший anti-pattern v4.x ("ломает Reality") был **необоснованным предположением**. TFO работает на TCP-уровне, Reality на TLS — не конфликтуют
+  - **Opt-out**: `DISABLE_TFO=1 sudo bash setup.sh --optimize` для нод за CDN/middlebox
 - **v5.0.2** — hotfix для копирования команды после диагностики:
   - **Bugfix**: после `--diagnose` команда `sudo bash <(curl ...) --optimize` обрезалась в терминалах/Telegram (длинная) и работала только в bash. Клиенты копировали кусок → "файл не найден"
   - **Fix**: `installed.sh` теперь сохраняется **рано** (до диагностики/TUI), после первого запуска всегда доступен короткий путь `/var/lib/vpn-node-builder/installed.sh`. Сообщение после diagnose показывает короткую команду как основную
