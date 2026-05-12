@@ -18,14 +18,18 @@ Universal Linux optimizer для VPN-нод (Xray Reality / sing-box / Hysteria2
 
 ## Совместимость
 
-- Работает рядом с **shieldnode v3.20.5+** (рекомендуется порядок: shieldnode → vpn-node-setup)
+- Работает рядом с **shieldnode v3.20.6+** (рекомендуется порядок: **vpn-node-setup первым, потом shieldnode** — минимизирует окно потери MSS clamp)
 - shieldnode владеет security sysctl (rp_filter, syncookies, etc.) — vpn-node-setup их не трогает с v5.0.4
 
 ## Установка
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/abcproxy70-ops/node/main/vpn-node-setup.sh)
+curl -fL https://raw.githubusercontent.com/abcproxy70-ops/node/main/vpn-node-setup.sh | sudo bash -s -- --optimize
 ```
+
+> ⚠️ Use `curl | sudo bash -s -- ARGS` вместо `bash <(curl ...)` — process
+> substitution не работает на OpenVZ/LXC контейнерах. Конструкция `-s --` нужна
+> чтобы передать аргументы (`--optimize`) в скрипт через pipe.
 
 После установки скрипт сам:
 - определит профиль ноды по RAM
@@ -33,6 +37,36 @@ bash <(curl -sL https://raw.githubusercontent.com/abcproxy70-ops/node/main/vpn-n
 - применит sysctl + qdisc + NIC tuning
 - настроит MSS clamp через nftables (table `inet vpn_node_mss_clamp`)
 - предложит reboot если ядро обновилось
+
+## Полная установка (vpn-node-setup + shieldnode)
+
+Рекомендуемый порядок:
+
+```bash
+# Step 1: vpn-node-setup первым (медленнее, может попросить reboot)
+curl -fL https://raw.githubusercontent.com/abcproxy70-ops/node/main/vpn-node-setup.sh | sudo bash -s -- --optimize
+
+# Если попросил reboot — reboot и проверь что новое ядро активно:
+# sudo reboot
+# uname -r   # должно содержать "xanmod-lts"
+
+# Step 2: shieldnode после reboot (быстро)
+curl -fL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode.sh | sudo bash
+
+# Step 3 (опционально): подстраховка для runtime sysctl (если ставил без reboot)
+sudo sysctl -w net.ipv4.tcp_notsent_lowat=4294967295
+IFACE=$(ip route | awk '/default/ {print $5; exit}')
+sudo sh -c "echo 0 > /sys/class/net/$IFACE/gro_flush_timeout"
+sudo sh -c "echo 0 > /sys/class/net/$IFACE/napi_defer_hard_irqs"
+
+# Verify
+sysctl net.ipv4.tcp_notsent_lowat   # ожидается 4294967295
+sudo guard --once                   # дашборд DDoS защиты
+```
+
+**Почему vpn-node-setup первым**: если установка vpn-node-setup потребует
+обновления ядра — reboot не нарушит ещё не установленный shieldnode. После
+reboot ставим shieldnode на стабильное ядро.
 
 ## Команды
 
