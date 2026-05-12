@@ -18,7 +18,7 @@ Universal Linux optimizer для VPN-нод (Xray Reality / sing-box / Hysteria2
 
 ## Совместимость
 
-- Работает рядом с **shieldnode v3.20.6+** (рекомендуется порядок: **vpn-node-setup первым, потом shieldnode** — минимизирует окно потери MSS clamp)
+- Работает рядом с **shieldnode v3.20.7+** (рекомендуется порядок: **vpn-node-setup первым, потом shieldnode** — минимизирует окно потери MSS clamp)
 - shieldnode владеет security sysctl (rp_filter, syncookies, etc.) — vpn-node-setup их не трогает с v5.0.4
 
 ## Установка
