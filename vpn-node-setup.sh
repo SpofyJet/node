@@ -8,7 +8,7 @@
 #  ██╔╝ ██╗██║  ██║██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝
 #  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ 
 #                                                         
-#  XRAY/REMNAWAVE NODE BUILDER v5.1.0 (UDP buffer fix — verified production)
+#  XRAY/REMNAWAVE NODE BUILDER v5.1.1 (LTS kernel detection fix)
 #  Ядро XanMod LTS + BBRv3 + Полная оптимизация системы + MSS clamp + Diagnostics
 #  Поддерживает: Debian 12/13, Ubuntu 22.04/24.04
 #
@@ -1663,10 +1663,24 @@ elif [ "${SKIP_KERNEL_INSTALL:-0}" = "1" ]; then
     print_status "LTS пакет уже установлен, пропускаю apt install."
     print_status "Перехожу к update-grub для смены default kernel..."
     INSTALL_RESULT=0
-    # NEW_KERNEL_VERSION должен быть определён для GRUB блока — вычисляем сейчас
-    NEW_KERNEL_VERSION=$(ls /boot/vmlinuz-*lts*xanmod* 2>/dev/null | xargs -I{} basename {} | sed 's/^vmlinuz-//' | sort -V | tail -1)
+    # NEW_KERNEL_VERSION должен быть определён для GRUB блока — вычисляем сейчас.
+    # v5.1.1 FIX: XanMod НЕ вставляет '-lts-' в имя файла vmlinuz, поэтому
+    # старый glob 'vmlinuz-*lts*xanmod*' всегда давал пустую строку.
+    # Перебираем KNOWN_LTS_BRANCHES и выбираем самое свежее LTS-ядро из /boot.
+    NEW_KERNEL_VERSION=""
+    for lts_branch in "${KNOWN_LTS_BRANCHES[@]}"; do
+        candidate=$(ls /boot/vmlinuz-${lts_branch}.*-x64v*-xanmod* 2>/dev/null | xargs -I{} basename {} 2>/dev/null | sed 's/^vmlinuz-//' | sort -V | tail -1)
+        if [ -n "$candidate" ]; then
+            if [ -z "$NEW_KERNEL_VERSION" ] || [ "$(printf '%s\n' "$NEW_KERNEL_VERSION" "$candidate" | sort -V | tail -1)" = "$candidate" ]; then
+                NEW_KERNEL_VERSION="$candidate"
+            fi
+        fi
+    done
     if [ -z "$NEW_KERNEL_VERSION" ]; then
         print_error "Не удалось определить версию установленного LTS — repin GRUB невозможен"
+        print_info "Искали в /boot/vmlinuz-* по веткам: ${KNOWN_LTS_BRANCHES[*]}"
+        print_info "Содержимое /boot/vmlinuz-*xanmod*:"
+        ls -1 /boot/vmlinuz-*xanmod* 2>/dev/null | sed 's/^/    /' || print_info "    (ничего не найдено)"
         exit 1
     fi
     print_info "Найден LTS kernel: $NEW_KERNEL_VERSION (будет установлен как GRUB default)"
@@ -1788,12 +1802,19 @@ if [ $INSTALL_RESULT -eq 0 ]; then
     # Если новое ядро битое — лучше узнать сейчас чем после ребута
     # ==========================================================================
 
-    # Определяем версию свежеустановленного ядра
-    # v5.0.4 (fix #42): glob '*lts*xanmod*' вместо '*xanmod*'.
-    # Иначе если параллельно стоит более новый MAIN xanmod (без -lts суффикса,
-    # например v6.20+), `sort -V | tail -1` выберет MAIN вместо нашего
-    # свежеустановленного LTS, и initrd validation проверит не тот файл.
-    NEW_KERNEL_VERSION=$(ls /boot/vmlinuz-*lts*xanmod* 2>/dev/null | xargs -I{} basename {} | sed 's/^vmlinuz-//' | sort -V | tail -1)
+    # Определяем версию свежеустановленного ядра.
+    # v5.1.1 FIX: '*lts*xanmod*' glob не работает — XanMod не вставляет 'lts' в имя файла.
+    # Перебираем KNOWN_LTS_BRANCHES чтобы выбрать самое свежее LTS-ядро
+    # (а не MAIN, который мог бы оказаться выше по версии).
+    NEW_KERNEL_VERSION=""
+    for lts_branch in "${KNOWN_LTS_BRANCHES[@]}"; do
+        candidate=$(ls /boot/vmlinuz-${lts_branch}.*-x64v*-xanmod* 2>/dev/null | xargs -I{} basename {} 2>/dev/null | sed 's/^vmlinuz-//' | sort -V | tail -1)
+        if [ -n "$candidate" ]; then
+            if [ -z "$NEW_KERNEL_VERSION" ] || [ "$(printf '%s\n' "$NEW_KERNEL_VERSION" "$candidate" | sort -V | tail -1)" = "$candidate" ]; then
+                NEW_KERNEL_VERSION="$candidate"
+            fi
+        fi
+    done
 
     if [ -n "$NEW_KERNEL_VERSION" ] && [ "$NEW_KERNEL_VERSION" != "$CURRENT_KERNEL" ]; then
         print_status "Валидация нового ядра: $NEW_KERNEL_VERSION"
