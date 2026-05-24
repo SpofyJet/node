@@ -29,14 +29,13 @@ Cost: 1M записей × ~316 байт = ~316MB RAM (4% на 8GB ноде).
 
 ## Совместимость
 
-- Работает рядом с **shieldnode v3.22.0+** (рекомендуется порядок: **vpn-node-setup первым, потом shieldnode** — минимизирует окно потери MSS clamp)
-- shieldnode владеет security sysctl (rp_filter, syncookies, etc.) — vpn-node-setup их не трогает с v5.0.4
-- vpn-node-setup владеет conntrack_max + TCP timeouts — shieldnode их не трогает
+- Не конфликтует с пользовательскими nft-таблицами и UFW (использует свою таблицу `inet vpn_node_mss_clamp`)
+- Не трогает security-sysctl (rp_filter, syncookies и т.п.) — если они уже выставлены другим инструментом, vpn-node-setup их не перезапишет
 
 ## Установка
 
 ```bash
-curl -fL https://raw.githubusercontent.com/abcproxy70-ops/node/main/vpn-node-setup.sh | sudo bash -s -- --optimize
+curl -fL https://raw.githubusercontent.com/SpofyJet/node/main/vpn-node-setup.sh | sudo bash -s -- --optimize
 ```
 
 > ⚠️ Use `curl | sudo bash -s -- ARGS` вместо `bash <(curl ...)` — process
@@ -49,31 +48,6 @@ curl -fL https://raw.githubusercontent.com/abcproxy70-ops/node/main/vpn-node-set
 - применит sysctl + qdisc + NIC tuning
 - настроит MSS clamp через nftables (table `inet vpn_node_mss_clamp`)
 - предложит reboot если ядро обновилось
-
-## Полная установка (vpn-node-setup + shieldnode)
-
-Рекомендуемый порядок:
-
-```bash
-# Step 1: vpn-node-setup первым (медленнее, может попросить reboot)
-curl -fL https://raw.githubusercontent.com/abcproxy70-ops/node/main/vpn-node-setup.sh | sudo bash -s -- --optimize
-
-# Если попросил reboot — reboot и проверь что новое ядро активно:
-# sudo reboot
-# uname -r   # должно содержать "xanmod-lts"
-
-# Step 2: shieldnode после reboot (быстро)
-curl -fL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode.sh | sudo bash
-
-# Verify
-sudo guard --once   # дашборд DDoS защиты
-sysctl net.netfilter.nf_conntrack_max   # ожидается 262144+ (или больше по tier)
-sysctl net.ipv4.tcp_congestion_control  # должно быть bbr
-```
-
-**Почему vpn-node-setup первым**: если установка vpn-node-setup потребует
-обновления ядра — reboot не нарушит ещё не установленный shieldnode. После
-reboot ставим shieldnode на стабильное ядро.
 
 ## Команды
 
@@ -93,20 +67,24 @@ sudo vpn-node-setup
 
 ## Версии
 
+- **v5.1.1** — REFACTOR + IMPROVEMENTS:
+  - **REFACTOR**: sysctl-файл переименован `99-vpn-node-tuning.conf` → **`80-vpn-node-tuning.conf`**. Префикс `80` — базовая полка tuning, любые security-overrides из `90-*.conf` или ad-hoc fixes `99-z-*.conf` корректно перекроют наши значения. Cleanup удаляет legacy `99-` файл при первой установке.
+  - **IMPR**: `tcp_adv_win_scale=-2` теперь во всех tier (раньше только TIER 3/4).
+  - **IMPR**: ethtool offloads — LRO off (defensive), `rx-udp-gro-forwarding on`.
+  - **IMPR**: попытка multi-queue NIC (`combined N`), silent fail на virtio max=1.
 - **v5.0.6** — CONNTRACK FIXES для 1000+ юзеров:
   - **TIER 2** (≤2.5GB RAM) conntrack_max 524288 → **786432** (запас на 1500+ юзеров)
   - **TIER 4** (>8.5GB RAM) conntrack_max 1048576 → **2097152** (для 3000+ юзеров на одной ноде, ранее TIER 4 был идентичен TIER 3)
   - **conntrack_tcp_timeout_established** 7200 → **86400** (long-lived TCP: SSH/Telegram MTProto/IMAP IDLE/WebSocket больше не дропается через 2 часа)
   - **TIER 2 vm.overcommit_memory=1** (защита от OOM на пиках на 2GB нодах)
   - Critical fix: installed.sh при `bash <(curl ...)` (был обрезанный файл)
-  - Убраны ложные упоминания "tcp_fastopen=3 ломает Reality" в комментах (TFO=3 работает корректно с Reality, разные слои стека)
 - **v5.0.5** — HEADLINE FIX: YouTube/streaming freeze. Убран `tcp_notsent_lowat=131072` (вернулся kernel default unlimited). Убран `gro_flush_timeout=50µs` defer (вернулся classic NAPI). Throughput не меняется, periodic stalls устраняются.
-- **v5.0.4** — ARCH SIMPLIFICATION (убраны пересечения с shieldnode v3.20.5): удалены 6 дублирующих sysctl, удалён iptables fallback в MSS clamp, atomic nft transaction, ExecStop с `-` префиксом. Critical fixes: DEFAULT_IFACE присваивается (NIC validation), GPG download-first + keyserver fallback.
+- **v5.0.4** — ARCH SIMPLIFICATION: удалены 6 дублирующих sysctl, удалён iptables fallback в MSS clamp, atomic nft transaction, ExecStop с `-` префиксом. Critical fixes: DEFAULT_IFACE присваивается (NIC validation), GPG download-first + keyserver fallback.
 - **v5.0.3** — HEADLINE FIX: `tcp_fastopen=3` (TFO для TCP клиентов и серверов). Решает bottleneck ~550-630 юзеров на ноду.
 - **v5.0.x** — Snapshot-based rollback, TUI menu по default, self-upgrade flow.
 - **v4.x** — XanMod LTS migration (с MAIN), tier-aware buffers, NIC бусты (GRO, ethtool, IRQ).
 
-Полная история: https://github.com/abcproxy70-ops/node/commits/main/vpn-node-setup.sh
+Полная история: https://github.com/SpofyJet/node/commits/main/vpn-node-setup.sh
 
 ## Лицензия
 
