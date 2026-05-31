@@ -67,6 +67,9 @@ sudo vpn-node-setup
 
 ## Версии
 
+- **v5.2.0** — LATENCY FIX + KERNEL REPLACE:
+  - **CRIT FIX**: `tcp_adv_win_scale` **-2 → 1** (дефолт ядра). `-2` анонсировал окно больше реального буфера → постоянный `tcp_collapse()`/prune на relay (намерено ~59 collapse/сек, TCPRcvCollapsed ~95M) → жжёный softirq + дропы на приёме → у клиентов микро-фризы, просадки, долгая загрузка видео/картинок. BBR делает свой pacing — минусов нет.
+  - **FEATURE**: реальная ЗАМЕНА чужого XanMod — после установки LTS purge чужих метапакетов (MAIN/edge/rt) + не-running не-LTS образов (running остаётся fallback до ребута). Под `--dry-run` печатает план purge без удаления. Отключение: `SETUP_NO_KERNEL_REPLACE=1`. Раньше чужая версия оставалась рядом и возвращалась через apt upgrade.
 - **v5.1.1** — REFACTOR + IMPROVEMENTS:
   - **REFACTOR**: sysctl-файл переименован `99-vpn-node-tuning.conf` → **`80-vpn-node-tuning.conf`**. Префикс `80` — базовая полка tuning, любые security-overrides из `90-*.conf` или ad-hoc fixes `99-z-*.conf` корректно перекроют наши значения. Cleanup удаляет legacy `99-` файл при первой установке.
   - **IMPR**: `tcp_adv_win_scale=-2` теперь во всех tier (раньше только TIER 3/4).
