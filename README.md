@@ -2,14 +2,18 @@
 
 Universal Linux optimizer для VPN-нод (Xray Reality / sing-box / Hysteria2 / WireGuard / AmneziaWG).
 
-Стэк: **XanMod LTS kernel + BBRv3 + tier-aware tuning**. Целевые ОС: Ubuntu 22.04/24.04, Debian 12/13.
+Стэк: **XanMod LTS kernel + BBRv3 + tier-aware tuning**. Целевые ОС: Ubuntu 24.04+, Debian 12/13.
+
+> ⚠️ **Ubuntu 22.04 (jammy) не поддерживается** — XanMod не публикует ядра для этого codename (curl-verified: 404). Обнови ОС до 24.04 или используй штатное ядро с BBR (`modprobe tcp_bbr`).
 
 ## Что делает
 
 - Ставит **XanMod LTS kernel** (с BBRv3 встроенным)
 - Tier-aware sysctl tuning (4 профиля по RAM: 1GB / 2GB / 4-8GB / 8GB+)
+- **QUIC buffers** правильно разделены: rmem/wmem_max (потолок setsockopt) поднят под quic-go/Hysteria2; tcp_rmem/tcp_wmem (TCP-автотюн для Reality) не привязаны к rmem_max
 - **qdisc fq** + multi-queue для NIC
-- **TCP buffers** под BDP (rmem_max до 32MB на TIER 4)
+- **QUIC/UDP buffers** (rmem_max/wmem_max): TIER1 8/8MB, TIER2 16/16MB, TIER3/4 16-32MB — закрывает quic-go (7.5MB) и Hysteria2 (16MB)
+- **TCP buffers** (tcp_rmem/tcp_wmem, автотюн): до 32MB на TIER 4; не лимитируется rmem_max
 - **TFO=3** (TCP Fast Open) — решает bottleneck 580-630 юзеров на ноду
 - **MSS clamp** через nftables (лечит PMTU blackhole у мобильных юзеров)
 - **conntrack tuning** под VPN-нагрузку (v5.0.6: tier-aware max + 24h tcp_established)
@@ -70,6 +74,26 @@ sudo vpn-node-setup
 - **v5.2.0** — LATENCY FIX + KERNEL REPLACE:
   - **CRIT FIX**: `tcp_adv_win_scale` **-2 → 1** (дефолт ядра). `-2` анонсировал окно больше реального буфера → постоянный `tcp_collapse()`/prune на relay (намерено ~59 collapse/сек, TCPRcvCollapsed ~95M) → жжёный softirq + дропы на приёме → у клиентов микро-фризы, просадки, долгая загрузка видео/картинок. BBR делает свой pacing — минусов нет.
   - **FEATURE**: реальная ЗАМЕНА чужого XanMod — после установки LTS purge чужих метапакетов (MAIN/edge/rt) + не-running не-LTS образов (running остаётся fallback до ребута). Под `--dry-run` печатает план purge без удаления. Отключение: `SETUP_NO_KERNEL_REPLACE=1`. Раньше чужая версия оставалась рядом и возвращалась через apt upgrade.
+- **v5.3.2** — XanMod codename guard + tuning corrections:
+  - **FIX**: guard на неподдерживаемый XanMod codename. Curl-verified: jammy (Ubuntu 22.04) и focal (20.04) → 404 на deb.xanmod.org. Раньше: FATAL без понятной причины. Теперь: ранний выход с чётким сообщением.
+  - **REVERT**: `tcp_no_metrics_save` убран (ядро: default=0 обычно лучше).
+  - **DOC**: MSS clamp эффективен с urезанным egress MTU (WARP/wgcf/PPPoE/5G); на прямом 1500 — inert.
+- **v5.3.1** — QUIC buffers + remnanode logrotate:
+  - **TUNE**: TIER1 rmem_max/wmem_max 4MB/2MB → **8MB/8MB** (quic-go требует ≥7.5MB; раньше QUIC-send резался в 2MB и quic-go писал "failed to sufficiently increase buffer").
+  - **TUNE**: TIER2 wmem_max 8MB → **16MB** (Hysteria2 рекомендует 16MB; rmem_max уже был 16MB).
+  - **FEAT**: logrotate для `/var/log/remnanode/*.log` (требование доков Remnawave; copytruncate — Xray держит файл открытым).
+- **v5.3.0** — robustness + reliability hardening:
+  - **CRIT FIX**: RAM-детект тиров из `/proc/meminfo` (MemTotal) вместо локале-зависимого `free` — защита от mis-tiering на non-English локалях.
+  - **CRIT FIX**: CPU без SSE4.2 → v1 ядро (раньше — v2, что = illegal instructions → unbootable).
+  - **FIX**: диагностика: клавиша `q` = выход (раньше перехватывалась quick-прогоном).
+  - **FIX**: самолечение битого xanmod-репо при повторном запуске после обрыва.
+  - **FIX**: `--upgrade` не теряет версию при ребуте внутри новой версии.
+  - **FIX**: IRQ affinity через `smp_affinity_list` — корректно на 32+ CPU.
+  - **FIX**: multipathd не отключается на multipath-root (анти-кирпич).
+  - **FIX**: unattended-upgrades отключение opt-out (`SETUP_DISABLE_UNATTENDED=0`).
+  - **FEAT**: zram-swap на TIER1/2 (анти-OOM; 50% RAM / max 512MB / zstd).
+  - **FEAT**: ring buffers на физ-NIC через udev (device-add, без per-boot link-flap).
+  - **FEAT**: scaffold проверки подписи апдейта (`SETUP_REQUIRE_SIG=1`, выкл по умолчанию).
 - **v5.1.1** — REFACTOR + IMPROVEMENTS:
   - **REFACTOR**: sysctl-файл переименован `99-vpn-node-tuning.conf` → **`80-vpn-node-tuning.conf`**. Префикс `80` — базовая полка tuning, любые security-overrides из `90-*.conf` или ad-hoc fixes `99-z-*.conf` корректно перекроют наши значения. Cleanup удаляет legacy `99-` файл при первой установке.
   - **IMPR**: `tcp_adv_win_scale=-2` теперь во всех tier (раньше только TIER 3/4).
