@@ -8,13 +8,25 @@
 #  ██╔╝ ██╗██║  ██║██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝
 #  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ 
 #                                                         
-#  XRAY/REMNAWAVE NODE BUILDER v5.3.3 (audit fixes: unattended/GRUB/IPv6-SSH/offloads)
+#  XRAY/REMNAWAVE NODE BUILDER v5.3.4 (audit fixes: RPS-mask >32CPU, conntrack est-timeout coord)
 #  Ядро XanMod LTS + BBRv3 + Полная оптимизация системы + MSS clamp + Diagnostics
 #  Поддерживает: Debian 12/13 (bookworm/trixie), Ubuntu 24.04+ (noble/plucky/…)
 #  ВНИМАНИЕ: Ubuntu 22.04 (jammy) и 20.04 (focal) НЕ поддерживаются — XanMod не
 #  публикует для них ядра (404 на deb.xanmod.org). Скрипт это проверяет и выходит
 #  рано с понятным сообщением (см. guard в ШАГ 4).
 #
+#  ============================================================================
+#  v5.3.4 (audit fixes 2026-06-13):
+#  ============================================================================
+#  FIX V2  rps_cpus-маска строится запятыми по 32-бит словам (старший первым). Старый
+#          одно-токеновый hex ядро отвергало на >32 CPU, а (1<<CPUS) переполнялся при
+#          CPUS>=64 → маска "0" = RPS off. Фикс inline + в генерируемом rps-tuning.sh.
+#  FIX X1  nf_conntrack_tcp_timeout_established 86400 → 7200, скоординировано с
+#          shieldnode (90-shieldnode.conf). Раньше 86400 в 80- молча проигрывал
+#          shieldnode-значению по лексикографике (90>80) → итог непредсказуем при
+#          совместной установке. Теперь оба пишут 7200 — детерминированно.
+#  FIX URL Канонический репо self-update выставлен на SpofyJet/node (был
+#          abcproxy70-ops/node) — совпадает с публикацией deploy-node.sh и raw-URL.
 #  ============================================================================
 #  v5.3.3 (audit fixes по отчёту аудита 2026-06-11):
 #  ============================================================================
@@ -140,8 +152,8 @@ set -o pipefail
 # ==============================================================================
 
 # v5.0: версия + repo URL для self-upgrade
-SCRIPT_VERSION="5.3.3"
-SCRIPT_REPO_URL="${SCRIPT_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/node/main/vpn-node-setup.sh}"
+SCRIPT_VERSION="5.3.4"
+SCRIPT_REPO_URL="${SCRIPT_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/node/main/vpn-node-setup.sh}"
 
 # v5.3.0 (fix #17): XanMod signing key ID вынесен в именованную константу.
 # Используется как fallback для keyserver когда dl.xanmod.org недоступен.
@@ -2611,7 +2623,10 @@ sysctl -w "net.netfilter.nf_conntrack_max=$CONNTRACK_MAX" 2>/dev/null || true
 # 86400 (24ч) — достаточно для активных юзеров, не создаёт мусора в таблице
 # (idle коннекты дропаются keepalive раньше). Минимум по апстрим-консенсусу
 # должен быть >= tcp_keepalive_time + N*tcp_keepalive_intvl = 7875 (default kernel).
-sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=86400 2>/dev/null || true
+# v5.3.4 FIX(X1): 86400 -> 7200, скоординировано с shieldnode (90-shieldnode.conf).
+# Раньше 86400 в 80- молча проигрывал shieldnode-1800 по лексикографике (90>80) —
+# теперь оба пишут 7200, итог детерминирован при любой комбинации установки.
+sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=7200 2>/dev/null || true
 sysctl -w net.netfilter.nf_conntrack_tcp_timeout_time_wait=60 2>/dev/null || true
 sysctl -w net.netfilter.nf_conntrack_tcp_timeout_close_wait=60 2>/dev/null || true
 # v4.13 CRIT-1: UDP timeouts (udp_timeout / udp_timeout_stream) НЕ выставляем —
@@ -2681,7 +2696,7 @@ cat > "$SYSCTL_FILE_CONSOLIDATED" <<EOF
 # Profile: $CONNTRACK_TIER (RAM ${CONNTRACK_TOTAL_MEM_MB}MB)
 # UDP timeouts здесь НЕ выставляются — владеет shieldnode (180/300).
 net.netfilter.nf_conntrack_max = $CONNTRACK_MAX
-net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200   # v5.3.4: 86400->7200 (coord. с shieldnode 90-)
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 60
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
 net.netfilter.nf_conntrack_generic_timeout = 300
@@ -3274,8 +3289,13 @@ else
         fi
         RPS_MODE="not needed (HW multi-queue)"
     else
-        # Битовая маска для всех CPU: (1 << N) - 1, в hex
-        MASK=$(printf "%x" $(( (1 << CPUS) - 1 )))
+        # v5.3.4 FIX(V2): rps_cpus требует cpumask запятыми по 32-бит словам (старший
+        # первым); (1<<CPUS) переполняется при CPUS>=64 (давало маску "0" = RPS off).
+        # Строим маску по группам — корректно при любом числе ядер.
+        _rem=$(( CPUS % 32 )); _full=$(( CPUS / 32 )); MASK=""
+        [ "$_rem" -gt 0 ] && MASK=$(printf '%x' $(( (1 << _rem) - 1 )))
+        _i=0; while [ "$_i" -lt "$_full" ]; do MASK="${MASK:+$MASK,}ffffffff"; _i=$((_i+1)); done
+        [ -z "$MASK" ] && MASK=0
         echo -e "    └─ Решение: ${GREEN}включаем RPS (mask=$MASK)${NC}"
         echo ""
 
@@ -3287,7 +3307,12 @@ IFACE=$(ip route | awk '/default/ {print $5; exit}')
 [ -z "$IFACE" ] && exit 0
 CPUS=$(nproc)
 [ "$CPUS" -le 1 ] && exit 0
-MASK=$(printf "%x" $(( (1 << CPUS) - 1 )))
+# v5.3.4 FIX(V2): cpumask запятыми по 32-бит словам (старший первым); без этого
+# на >32 CPU ядро отвергало одно-токеновый hex, а при CPUS>=64 маска была "0".
+_rem=$(( CPUS % 32 )); _full=$(( CPUS / 32 )); MASK=""
+[ "$_rem" -gt 0 ] && MASK=$(printf '%x' $(( (1 << _rem) - 1 )))
+_i=0; while [ "$_i" -lt "$_full" ]; do MASK="${MASK:+$MASK,}ffffffff"; _i=$((_i+1)); done
+[ -z "$MASK" ] && MASK=0
 for q in /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus; do
     [ -w "$q" ] && echo $MASK > $q
 done
