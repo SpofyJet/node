@@ -8,13 +8,115 @@
 #  ██╔╝ ██╗██║  ██║██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝
 #  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ 
 #                                                         
-#  XRAY/REMNAWAVE NODE BUILDER v5.3.4 (audit fixes: RPS-mask >32CPU, conntrack est-timeout coord)
+#  XRAY/REMNAWAVE NODE BUILDER v5.10.0 (bg cleanup: only 100% garbage + real disable)
 #  Ядро XanMod LTS + BBRv3 + Полная оптимизация системы + MSS clamp + Diagnostics
 #  Поддерживает: Debian 12/13 (bookworm/trixie), Ubuntu 24.04+ (noble/plucky/…)
 #  ВНИМАНИЕ: Ubuntu 22.04 (jammy) и 20.04 (focal) НЕ поддерживаются — XanMod не
 #  публикует для них ядра (404 на deb.xanmod.org). Скрипт это проверяет и выходит
 #  рано с понятным сообщением (см. guard в ШАГ 4).
 #
+#  ============================================================================
+#  v5.10.0 (bg cleanup — только 100% мусор + РЕАЛЬНОЕ отключение):
+#  ============================================================================
+#  FIX disable был МНИМЫМ для части сервисов: ModemManager/bluetooth/thermald/
+#       accounts-daemon/udisks2/packagekit — static/dbus-activated юниты без
+#       [Install]. Для них is-enabled → ошибка (старый цикл их молча
+#       пропускал), а disable → "unit is static" (юнит жил дальше). Новый
+#       helper disable_unit_real: disable --now → проверка по факту →
+#       mask --now если выжил (глушит и dbus-активацию) → финальная
+#       верификация. Применён ко ВСЕМ спискам (ШАГ 2 + ШАГ 2.5 + irqbalance).
+#  TRIM список ужат до 100% мусора (нет роли на headless ноде вообще).
+#       Убраны как "имеющие роль": man-db.timer (apropos), plocate/mlocate
+#       (locate), atd, ua-timer (Ubuntu Pro), power-profiles-daemon (governor
+#       на bare metal), tuned, sysstat (sar), e2scrub (LVM fsck),
+#       fwupd (прошивки на bare metal).
+#  ============================================================================
+#  v5.9.0 (background cleanup — вторая волна):
+#  ============================================================================
+#  NEW ШАГ 2.5 дополнен: plocate/mlocate updatedb (ежедневный full-FS index —
+#       CPU/IO spike), avahi (mDNS listener), bluetooth, wpa_supplicant, atd,
+#       power-profiles-daemon/tuned (tuned мог перетирать sysctl), sysstat,
+#       e2scrub_all.timer, cups/bolt.
+#  NEW irqbalance отключается — он КОНФЛИКТОВАЛ с ручной IRQ affinity
+#       (nic-tuning smp_affinity_list): перетирал привязку каждые ~10с.
+#  NEW rpcbind: если NFS-маунтов нет — disable+mask (порт 111, лишний listener).
+#  NEW MTA opt-in (SETUP_DISABLE_MTA=1): exim4/postfix ~10-20MB RAM.
+#  NEW fail2ban+crowdsec одновременно → warning про дубль ban-движка.
+#  ============================================================================
+#  v5.8.0 (background services cleanup):
+#  ============================================================================
+#  NEW ШАГ 2.5: отключение фоновых сервисов, жрущих RAM/CPU на VPS-ноде:
+#       packagekit (50-100MB + фоновые apt-refresh), man-db.timer (ежедневный
+#       CPU/IO spike), motd-news.timer, ua-timer.timer (Ubuntu Pro polling),
+#       accounts-daemon, switcheroo-control, colord, thermald. Всё disable
+#       (пакеты остаются, обратимо). Opt-out: SETUP_DISABLE_BG_SERVICES=0.
+#  NEW needrestart → list-only режим: на Ubuntu 24 он АВТО-перезапускал
+#       сервисы после apt (мог дёрнуть xray/crowdsec посреди работы) и
+#       сканировал все процессы на каждый apt-run. Теперь только показывает.
+#  NEW snapd opt-in (SETUP_DISABLE_SNAPD=1): ~40-70MB RAM + refresh таймеры.
+#       Не по умолчанию — на Ubuntu Pro snapd связан с cloud-init (v4.10).
+#  ============================================================================
+#  v5.7.0 (stage5 — hw offload + zram writeback + tcp_plb):
+#  ============================================================================
+#  NEW  Hardware flow offload (ШАГ 7.9): probe `flags offload` на реальном NIC.
+#       На mlx5/bnxt/i40e/ice (kernel >= 5.16) established-потоки оффлоадятся
+#       в силикон NIC — CPU вообще не обрабатывает эти пакеты. Перед probe
+#       ethtool -K $IFACE hw-tc-offload on (требуется mlx5). Graceful fallback
+#       на software offload на virtio/e1000/VPS. Opt-out: DISABLE_HW_FLOW_OFFLOAD=1.
+#  NEW  zram writeback (ШАГ 7.4): ZRAM_WRITEBACK_DEV=/dev/sdXN — выгрузка
+#       incompressible/idle страниц из zram на диск, освобождая RAM.
+#       Ручной путь настройки (backing_dev обязан идти ДО disksize).
+#  NEW  zram vm-тюнинг (99-vpn-zram.conf): swappiness=180 (zram быстрый —
+#       агрессивный swapout выгоден; kernel >= 5.8), page-cluster=0 (постраничное
+#       чтение из RAM-backed swap), watermark_boost_factor=0 (нет преждевременного
+#       reclaim при фрагментации).
+#  NEW  net.ipv4.tcp_plb_enabled=1 (kernel >= 6.3, PLB): при повторных RTO
+#       пересматривает route lookup — поток уходит на другой путь ECMP/LAG,
+#       обходя перегруженный линк ДЦ. На старых ядрах молча игнорируется.
+#  ============================================================================
+#  v5.6.0 (stage4 — UDP buffers + busy_poll opt-in):
+#  ============================================================================
+#  TUNE TIER3 rmem_max/wmem_max 16MB → 32MB: Hysteria2/TUIC sender на 4-8GB
+#       ноде упирался в 16MB при BDP >200Мбит×100ms (intercontinental).
+#       Потолок setsockopt, RAM не резервируется — безопасно.
+#  TUNE TIER4 rmem_max/wmem_max 32MB → 64MB: 10G-нода, BDP 10G×250ms=312MB
+#       суммарно, per-socket 64MB покрывает 2 потока. Ранее 64MB отклоняли —
+#       но то было для TCP (Reality), для UDP-протоколов потолок влияет на
+#       quic-go/hy2 sender. udp_mem ceiling защищает от system-wide перерасхода.
+#  NEW  busy_poll opt-in (ENABLE_BUSY_POLL=1): net.core.busy_poll/busy_read=50µs.
+#       -10-30µs latency на packet delivery (NAPI spin вместо сна на IRQ).
+#       Цена: CPU spin. На ноде с 500+ клиентов spin не пустой — ОК; на пустой —
+#       впустую. По умолчанию ВЫКЛ (0), включение осознанное.
+#  NOTE tcp_notsent_lowat НЕ возвращаем (удалён в v5.0.5 с обоснованием:
+#       VPN-relay, не веб-сервер — на Xray chunks это вредит, не помогает).
+#  ============================================================================
+#  v5.5.0 (stage2 — контракт + coalescing):
+#  ============================================================================
+#  NEW ШАГ 8.5 STACK CONTRACT: /etc/node-profile.d/stack.conf — явный контракт
+#       между vpn-node-setup и shieldnode (кто владеет MSS clamp, статус IPv6,
+#       iface, flowtable, kernel, BBR, RAM-профиль). INI-секции [vpn-node-setup]
+#       и [shieldnode], каждый скрипт пишет только свою. Убирает класс багов
+#       "кто за что отвечает" (двойной MSS clamp и т.п.).
+#  NEW БУСТ 2.7 Adaptive Interrupt Coalescing (ethtool -C adaptive-rx/tx on):
+#       динамический IRQ batching под нагрузкой без постоянного джиттера
+#       статичного rx-usecs. Graceful skip на virtio_net. Persistent через
+#       nic-tuning.service.
+#  ============================================================================
+#  v5.4.0 (stage1 — производительность форвардинга):
+#  ============================================================================
+#  NEW ШАГ 7.9 FLOWTABLE: nftables software flow offloading. Established-потоки
+#       идут ingress→egress минуя filter/forward цепочки — снимает per-packet
+#       overhead на нодах с тысячами одновременных соединений. Только
+#       established/related: новые соединения идут полный путь (shieldnode
+#       rate-limits и MSS clamp работают как раньше). Live apply + systemd
+#       unit (vpn-flowtable.service). Probe с graceful fallback на старых
+#       kernel/nft. Отключить: DISABLE_FLOWTABLE=1.
+#  NEW BBR runtime activation: modprobe tcp_bbr + sysctl -w прямо при установке
+#       (раньше BBR активировался только после ребута на XanMod).
+#  NEW BBR version detect: различает BBRv1 (mainline <6.13) и BBRv3
+#       (XanMod / mainline >=6.13), честный warning если получили v1.
+#       Показывается в итоговом отчёте (строки TCP Congestion / BBR runtime /
+#       Flow offload).
 #  ============================================================================
 #  v5.3.5 (est-timeout 7200 → 14400):
 #  ============================================================================
@@ -94,8 +196,8 @@
 #  FEAT  опц. проверка подписи апдейта (SETUP_REQUIRE_SIG=1, по умолч. выкл) (#5)
 #  MISC  GPG key ID → константа; node-diag детект по содержимому; SC2086 закрыты (#17,#14)
 #
-#  Полный CHANGELOG: https://github.com/abcproxy70-ops/node/blob/main/CHANGELOG.md
-#  Документация:    https://github.com/abcproxy70-ops/node
+#  Полный CHANGELOG: в шапке этого файла (по версиям, newest-first)
+#  Документация:    https://github.com/SpofyJet/node
 #
 #  ============================================================================
 #  Кратко о текущей версии (v5.1.0 — UDP buffer fix):
@@ -160,7 +262,7 @@ set -o pipefail
 # ==============================================================================
 
 # v5.0: версия + repo URL для self-upgrade
-SCRIPT_VERSION="5.3.5"
+SCRIPT_VERSION="5.10.0"
 SCRIPT_REPO_URL="${SCRIPT_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/node/main/vpn-node-setup.sh}"
 
 # v5.3.0 (fix #17): XanMod signing key ID вынесен в именованную константу.
@@ -1482,11 +1584,40 @@ print_status "Отключаем ненужные сервисы..."
 # на multipath его отключение делает систему незагружаемой после ребута (maps не
 # соберутся). Включаем в список только если активных multipath-карт нет И root не
 # на dm/mapper-устройстве.
+# v5.10.0: fwupd УБРАН из списка — на bare metal он реально обновляет прошивки
+# (BIOS/диски/сетёвки), это не мусор. ModemManager (телефонные модемы) и
+# udisks2 (десктопный автомаунт) на headless-ноде роли не имеют.
 SERVICES_TO_DISABLE=(
     "ModemManager"
-    "fwupd"
     "udisks2"
 )
+
+# v5.10.0: РЕАЛЬНОЕ отключение юнита. Проверка показала: многие демоны из
+# списка (ModemManager, bluetooth, thermald, accounts-daemon, udisks2...) —
+# static/dbus-activated юниты БЕЗ [Install]. Для них:
+#   - `systemctl is-enabled` → ошибка → старый цикл их МОЛЧА ПРОПУСКАЛ
+#   - `systemctl disable` → "unit is static" → юнит продолжал жить
+# Отключение было мнимым. Реальный путь: disable --now → проверить статус →
+# если выжил (static/dbus) → mask --now (это глушит и dbus-активацию).
+# Возврат: 0=отключили, 2=юнита нет в системе, 3=уже был мёртв, 1=не смогли.
+disable_unit_real() {
+    local unit="$1"
+    systemctl list-unit-files "$unit" >/dev/null 2>&1 || return 2
+    if ! systemctl is-active "$unit" >/dev/null 2>&1 && \
+       ! systemctl is-enabled "$unit" >/dev/null 2>&1; then
+        return 3
+    fi
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    # Static/dbus-activated переживают disable — добиваем маской.
+    if systemctl is-active "$unit" >/dev/null 2>&1 || \
+       systemctl is-enabled "$unit" >/dev/null 2>&1; then
+        systemctl mask --now "$unit" >/dev/null 2>&1 || true
+    fi
+    # Финальная верификация по факту
+    systemctl is-active "$unit" >/dev/null 2>&1 && return 1
+    systemctl is-enabled "$unit" >/dev/null 2>&1 && return 1
+    return 0
+}
 
 MULTIPATH_IN_USE=0
 if command -v multipath >/dev/null 2>&1 && [ -n "$(multipath -ll 2>/dev/null)" ]; then
@@ -1528,14 +1659,175 @@ else
 fi
 
 for svc in "${SERVICES_TO_DISABLE[@]}"; do
-    if systemctl is-enabled "$svc" &>/dev/null; then
-        systemctl disable --now "$svc" 2>/dev/null || true
-        print_ok "Отключён: $svc"
-    else
-        print_info "Уже отключён или не найден: $svc"
-    fi
+    disable_unit_real "$svc"
+    rc=$?
+    case $rc in
+        0) print_ok "Отключён (проверено): $svc" ;;
+        2) print_info "Не установлен: $svc" ;;
+        3) print_info "Уже неактивен: $svc" ;;
+        1) print_warn "НЕ удалось отключить: $svc — проверь вручную (systemctl status $svc)" ;;
+    esac
 done
 echo ""
+
+# ==============================================================================
+# ШАГ 2.5: BACKGROUND SERVICES CLEANUP (v5.8.0)
+# ==============================================================================
+# Фоновые демоны и таймеры, которые на VPN-ноде только жрут RAM/CPU.
+# Аудит типичного VPS-образа (Debian 12/13, Ubuntu 24.04+):
+#   packagekit         50-100MB RAM + фоновые apt-refresh (дубль apt-daily)
+#   man-db.timer       ежедневный пересчёт mandb → CPU/IO spike в случайное время
+#   motd-news.timer    сетевой fetch "новостей" для MOTD (лишний egress + таймер)
+#   ua-timer.timer     Ubuntu Pro polling (на ноде без Pro-подписки бесполезен)
+#   accounts-daemon    AccountsService (десктопный, dbus-activated)
+#   switcheroo-control GPU-switching для ноутбуков (на VPS нет GPU)
+#   colord             color management (десктопный)
+#   thermald           thermal daemon (на VPS термодатчиков нет, спит вечно)
+# Всё ниже — disable --now (пакеты остаются, обратимо одной командой).
+# Opt-out всего шага: SETUP_DISABLE_BG_SERVICES=0.
+
+if [ "${SETUP_DISABLE_BG_SERVICES:-1}" = "1" ]; then
+    print_header "ШАГ 2.5: CLEANUP фоновых сервисов (RAM/CPU)"
+
+    # v5.10.0: список ужат до 100% МУСОРА — сервисов, у которых на headless
+    # VPN-ноде нет никакой роли в принципе. Убраны из списка (имеют роль):
+    #   man-db.timer (apropos/whatis), plocate/mlocate (locate), atd (at),
+    #   ua-timer (нужен на Ubuntu Pro), power-profiles-daemon (governor на
+    #   bare metal), tuned (ставят осознанно), sysstat (sar-мониторинг),
+    #   e2scrub (online fsck на LVM).
+    BG_SERVICES=(
+        # PackageKit — десктопный апдейтер (GNOME Software), на headless мусор.
+        "packagekit.service"
+        # "Новости" в MOTD — рекламный fetch от Ubuntu. Мусор.
+        "motd-news.timer"
+        # AccountsService — учётки для десктопных сессий (GDM/GNOME). Headless мусор.
+        "accounts-daemon.service"
+        # GPU-switching для ноутбуков с двумя видеокартами. Мусор.
+        "switcheroo-control.service"
+        # Управление цветовыми профилями мониторов/принтеров. Мусор.
+        "colord.service"
+        # Термодатчики/кулеры — на VPS их нет физически. Мусор.
+        "thermald.service"
+        # mDNS/DNS-SD — анонсы в LAN. На публичной ноде мусор + лишний listener.
+        "avahi-daemon.service"
+        "avahi-daemon.socket"
+        # Bluetooth/WiFi-стек — на VPS нет железа. Мусор.
+        "bluetooth.service"
+        "wpa_supplicant.service"
+        # Печать. Мусор.
+        "cups.service"
+        "cups.socket"
+        "cups-browsed.service"
+        # Thunderbolt-устройства. Мусор.
+        "bolt.service"
+    )
+    BG_DISABLED=0
+    for svc in "${BG_SERVICES[@]}"; do
+        disable_unit_real "$svc"
+        rc=$?
+        case $rc in
+            0) print_ok "Отключён (проверено): $svc"; BG_DISABLED=$((BG_DISABLED + 1)) ;;
+            2) : ;;  # не установлен — молчим (чистый образ)
+            3) : ;;  # уже мёртв
+            1) print_warn "НЕ удалось отключить: $svc — проверь вручную" ;;
+        esac
+    done
+    [ "$BG_DISABLED" -eq 0 ] && print_info "Фоновые сервисы из списка не найдены (чистый образ)"
+
+    # irqbalance — ОСОБЫЙ случай: он динамически перераспределяет IRQ affinity
+    # и КОНФЛИКТУЕТ с нашей ручной привязкой IRQ (nic-tuning, smp_affinity_list):
+    # перетирает её при каждой ребалансировке (~10с). На ноде с pinned IRQ
+    # должен быть выключен. RAM ~5MB + постоянная фоновая активность.
+    if systemctl is-active irqbalance.service >/dev/null 2>&1; then
+        if disable_unit_real irqbalance.service; then
+            print_ok "irqbalance отключён (проверено) — конфликтовал с ручной IRQ affinity (перетирал smp_affinity)"
+        else
+            print_warn "irqbalance не отключился — IRQ affinity под угрозой, проверь вручную"
+        fi
+    fi
+
+    # rpcbind + nfs-client — portmapper для NFS. На ноде без NFS-маунтов это
+    # лишний network-listener (порт 111) + поверхность атаки. Трогаем ТОЛЬКО
+    # если NFS-маунтов реально нет.
+    if ! findmnt -t nfs,nfs4,cifs >/dev/null 2>&1; then
+        if systemctl is-active rpcbind.service >/dev/null 2>&1 || \
+           systemctl is-enabled rpcbind.service >/dev/null 2>&1; then
+            systemctl disable --now rpcbind.service rpcbind.socket >/dev/null 2>&1 || true
+            systemctl mask rpcbind.service rpcbind.socket >/dev/null 2>&1 || true
+            print_ok "rpcbind отключён+замаскирован (NFS-маунтов нет — portmapper не нужен, порт 111 закрыт)"
+        fi
+    else
+        print_info "rpcbind ОСТАВЛЕН — обнаружены NFS/CIFS маунты"
+    fi
+
+    # Локальный MTA (exim4/postfix) — 10-20MB RAM, на ноде почта не отправляется
+    # (cron MAILTO не настроен → всё равно в никуда). НЕ отключаем по умолчанию:
+    # вдруг у оператора что-то шлёт почту. Opt-in: SETUP_DISABLE_MTA=1
+    if [ "${SETUP_DISABLE_MTA:-0}" = "1" ]; then
+        for mta in exim4.service postfix.service sendmail.service; do
+            if systemctl is-active "$mta" >/dev/null 2>&1; then
+                systemctl disable --now "$mta" >/dev/null 2>&1 || true
+                print_ok "Локальный MTA отключён: $mta"
+            fi
+        done
+    else
+        for mta in exim4.service postfix.service; do
+            if systemctl is-active "$mta" >/dev/null 2>&1; then
+                print_info "Активен локальный MTA ($mta, ~10-20MB RAM) — выключить: SETUP_DISABLE_MTA=1"
+                break
+            fi
+        done
+    fi
+
+    # fail2ban — если установлен вместе с shieldnode (CrowdSec), это ДУБЛЬ:
+    # два движка парсят одни и те же логи (CPU×2 на log-heavy ноде) и могут
+    # банить рассинхронно. Не отключаем автоматически (вдруг CrowdSec ещё не
+    # стоит), но предупреждаем.
+    if systemctl is-active fail2ban.service >/dev/null 2>&1; then
+        if systemctl is-active crowdsec.service >/dev/null 2>&1; then
+            print_warn "fail2ban И crowdsec активны одновременно — дубль ban-движка (двойной парсинг логов)."
+            print_info "Рекомендация: systemctl disable --now fail2ban (shieldnode покрывает его сценарии)"
+        else
+            print_info "fail2ban активен — оставляю (CrowdSec не обнаружен)"
+        fi
+    fi
+
+    # needrestart: после каждого apt сканирует ВСЕ процессы (CPU spike) и на
+    # Ubuntu 24 АВТО-перезапускает сервисы — может неожиданно дёрнуть xray/
+    # crowdsec посреди работы. Режим 'l' (list-only): показывает что нуждается
+    # в рестарте, но не трогает ничего. kernelhints/ucodehints=0 — не грузить
+    # проверками микрокода на VPS.
+    if [ -d /etc/needrestart ] || command -v needrestart >/dev/null 2>&1; then
+        mkdir -p /etc/needrestart/conf.d
+        cat > /etc/needrestart/conf.d/99-vpn-node.conf <<'NEEDRESTART_EOF'
+# vpn-node-setup v5.8.0: needrestart в list-only режиме — БЕЗ авто-рестартов
+# сервисов после apt (xray/crowdsec перезапускаем осознанно, не в фоне).
+$nrconf{restart} = 'l';
+$nrconf{kernelhints} = 0;
+$nrconf{ucodehints} = 0;
+NEEDRESTART_EOF
+        print_ok "needrestart: list-only режим (нет авто-рестартов сервисов после apt)"
+    fi
+
+    # snapd — самый жирный фоновый потребитель на Ubuntu (~40-70MB RAM постоянно
+    # + snapd.refresh таймеры). НЕ отключаем по умолчанию: на Ubuntu Pro snapd
+    # может быть связан с cloud-init (v4.10, анти-lockout). Осознанный opt-in:
+    #   SETUP_DISABLE_SNAPD=1 sudo bash vpn-node-setup.sh --optimize
+    if [ "${SETUP_DISABLE_SNAPD:-0}" = "1" ]; then
+        if systemctl list-unit-files snapd.service >/dev/null 2>&1; then
+            systemctl disable --now snapd.service snapd.socket snapd.refresh.timer >/dev/null 2>&1 || true
+            systemctl mask snapd.service >/dev/null 2>&1 || true
+            print_ok "snapd отключён и замаскирован (SETUP_DISABLE_SNAPD=1) — вернуть: systemctl unmask snapd && systemctl enable --now snapd"
+        else
+            print_info "snapd не установлен"
+        fi
+    else
+        systemctl is-active snapd.service >/dev/null 2>&1 && \
+            print_info "snapd активен (~40-70MB RAM) — выключить осознанно: SETUP_DISABLE_SNAPD=1 (Ubuntu Pro: не трогай)"
+    fi
+else
+    print_info "ШАГ 2.5 пропущен (SETUP_DISABLE_BG_SERVICES=0)"
+fi
 
 # --- Ограничение journald ---
 print_status "Ограничиваем размер логов journald..."
@@ -2832,6 +3124,12 @@ net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_slow_start_after_idle = 0
 # Автоматическое определение MTU (избежание фрагментации в туннелях)
 net.ipv4.tcp_mtu_probing = 1
+# PLB (Protective Load Balancing, v5.7.0, kernel >= 6.3): при повторяющихся
+# RTO-таймаутах принудительно пересматривает route/conntrack lookup — поток
+# перебрасывается на другой путь в ECMP/LAG, обходя перегруженный линк ДЦ.
+# Бесплатно и безопасно; на kernel < 6.3 ключ молча игнорируется (sysctl -p
+# пропускает неизвестные), на XanMod 6.x активен.
+net.ipv4.tcp_plb_enabled = 1
 # RFC 1337 (TIME_WAIT assassination) — moved to shieldnode (90-shieldnode.conf, v5.0.4)
 # (раньше: net.ipv4.tcp_rfc1337 = 1)
 # v5.0.3: TCP Fast Open включён по умолчанию (бывший anti-pattern v4.x был ОШИБКОЙ).
@@ -2942,6 +3240,28 @@ fs.inotify.max_user_instances = 8192
 fs.inotify.max_queued_events = 65536
 EOF
 
+# --- v5.6.0 (stage4): busy_poll opt-in (ENABLE_BUSY_POLL=1) ---
+# Low-latency socket polling: приложение в recv() крутится в NAPI poll
+# вместо сна на IRQ → -10-30µs latency на packet delivery.
+#
+# ЦЕНА: busy_poll жжёт CPU даже когда пакетов НЕТ (spin до таймаута).
+# На VPN-ноде с 500+ клиентов почти всегда есть пакеты — spin не пустой,
+# это ОК. На пустой ноде — пустой spin (проценты CPU впустую).
+#
+# ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО (0) — включение осознанное:
+#   ENABLE_BUSY_POLL=1 bash vpn-node-setup.sh
+#   или записать в /etc/sysctl.d/99-zz-custom.conf вручную.
+# 50 (мкс) — консервативно; рекомендации Red Hat для low-latency 50-100.
+if [ "${ENABLE_BUSY_POLL:-0}" = "1" ]; then
+    cat >> $SYSCTL_FILE <<EOF
+
+# v5.6.0: busy_poll (ENABLE_BUSY_POLL=1, low-latency opt-in)
+net.core.busy_poll = 50
+net.core.busy_read = 50
+EOF
+    print_info "busy_poll=50µs (ENABLE_BUSY_POLL=1): -10-30µs latency, +CPU spin"
+fi
+
 # --- Профильные настройки (зависят от RAM) ---
 if [ "$TOTAL_MEM_MB" -le 1200 ]; then
     cat >> $SYSCTL_FILE <<EOF
@@ -3012,8 +3332,11 @@ elif [ "$TOTAL_MEM_MB" -le 8500 ]; then
     cat >> $SYSCTL_FILE <<EOF
 
 # === TIER 3: 4-8GB RAM (PERFORMANCE MODE) ===
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
+# v5.6.0 (stage4): rmem_max/wmem_max 16MB → 32MB (потолок setsockopt).
+# Hysteria2/TUIC sender на 4-8GB ноде упирался в 16MB при BDP >200Мбит×100ms
+# (intercontinental links). RAM не резервируется — потолок безопасен.
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
 # v5.1.0 CRITICAL: rmem_default 524288 → 8388608 (8MB).
 # Verified в production (causal-violet-pike 8GB, 5895 active TCP +
 # 528 UDP sockets, peak hours): после изменения RcvbufErrors → 0,
@@ -3036,8 +3359,14 @@ else
     cat >> $SYSCTL_FILE <<EOF
 
 # === TIER 4: 8GB+ RAM (ULTRA 10G MODE) ===
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
+# v5.6.0 (stage4): rmem_max/wmem_max 32MB → 64MB (потолок setsockopt).
+# 10G-нода с Hysteria2: BDP на 10G×250ms = 312MB суммарно, per-socket 64MB
+# покрывает 2 потока. Ранее отклоняли 64MB как "лишнее" — но то было для
+# TCP (Reality), а для UDP-протоколов потолок влияет на quic-go/hy2 sender.
+# RAM НЕ резервируется потолком — аллокация по факту BDP, udp_mem ceiling
+# (ниже) защищает от system-wide перерасхода.
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
 # v5.1.0: rmem_default 1048576 → 8388608 (8MB).
 # На больших ноды можно даже больше, но 8MB достаточно для 90% workloads.
 # Для специальных нагрузок (10G+ throughput) поднять до 16MB через
@@ -3072,7 +3401,60 @@ print_status "Применяем sysctl конфигурацию (tuning + connt
 if [ -f "$SYSCTL_FILE_CONSOLIDATED" ]; then
     sysctl -p "$SYSCTL_FILE_CONSOLIDATED" 2>/dev/null | tail -5
 fi
-print_ok "Sysctl применён (BBR и qdisc активируются после ребута на XanMod; IPv6 — после ребута)"
+
+# === v5.4.0 (stage1): BBR RUNTIME ACTIVATION + BBRv3 DETECT ===
+# Раньше: запись в sysctl-файл есть, но tcp_congestion_control активировался
+# только после ребута на новое ядро. Теперь: modprobe tcp_bbr + runtime-apply
+# прямо сейчас + детект версии BBR (v1 vs v3) для итогового отчёта.
+#
+# BBRv3: mainline с kernel 6.13+ (sysctl net.ipv4.tcp_congestion_control=bbr
+# под капотом уже v3), на XanMod — бэкпорт (их `bbr` = v3). На ванильном
+# kernel < 6.13 `bbr` = v1 (работает, но хуже при loss/shared-media).
+# Детектируем и честно показываем что получили.
+
+# 1. Runtime-активация BBR (без ребута), если модуль доступен на ТЕКУЩЕМ ядре
+BBR_RUNTIME_STATUS="deferred (ребут на XanMod)"
+if modprobe tcp_bbr 2>/dev/null || grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        if sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+            CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+            if [ "$CURRENT_CC" = "bbr" ]; then
+                BBR_RUNTIME_STATUS="active (runtime)"
+                print_ok "BBR активирован в runtime (без ребута): tcp_congestion_control=bbr"
+            fi
+        fi
+    else
+        print_info "tcp_bbr недоступен на текущем ядре ($(uname -r)) — активируется после ребута на XanMod"
+    fi
+fi
+
+# 2. BBR version detect (v1 vs v3). Точного sysctl-флага версии нет —
+#    выводим по источнику ядра:
+#      - XanMod (любой свежий)         → BBRv3 (бэкпорт, их маркетинг)
+#      - mainline kernel >= 6.13       → BBRv3 (upstream merge)
+#      - mainline kernel < 6.13        → BBRv1
+KERNEL_VER_STR=$(uname -r)
+KERNEL_MAJ=$(echo "$KERNEL_VER_STR" | cut -d. -f1)
+KERNEL_MIN=$(echo "$KERNEL_VER_STR" | cut -d. -f2)
+BBR_VERSION="unknown"
+
+if echo "$KERNEL_VER_STR" | grep -qi xanmod; then
+    BBR_VERSION="v3 (XanMod backport)"
+elif [ "${KERNEL_MAJ:-0}" -gt 6 ] 2>/dev/null || \
+     { [ "${KERNEL_MAJ:-0}" -eq 6 ] && [ "${KERNEL_MIN:-0}" -ge 13 ]; } 2>/dev/null; then
+    BBR_VERSION="v3 (mainline >= 6.13)"
+elif [ "$BBR_RUNTIME_STATUS" = "active (runtime)" ]; then
+    BBR_VERSION="v1 (mainline < 6.13 — рекомендуется ребут на XanMod для v3)"
+fi
+
+if [ "$BBR_VERSION" = "v1 (mainline < 6.13 — рекомендуется ребут на XanMod для v3)" ]; then
+    print_warn "Текущее ядро даёт BBRv1. BBRv3 (лучше при packet loss и на shared-media)"
+    print_warn "появится после ребута на XanMod, либо на mainline kernel >= 6.13."
+else
+    print_info "BBR version: $BBR_VERSION"
+fi
+
+print_ok "Sysctl применён (BBR: $BBR_RUNTIME_STATUS; IPv6 — после ребута)"
 
 # ==============================================================================
 # ШАГ 7.4: ZRAM SWAP (v5.3.0 — anti-OOM на TIER 1/2)  [fix #13]
@@ -3097,18 +3479,33 @@ if [ "$TOTAL_MEM_MB" -le 2500 ] && [ "${SETUP_NO_ZRAM:-0}" != "1" ]; then
             # Генератор устройства + systemd-unit для персистентности после ребута.
             cat > /usr/local/sbin/vpn-zram.sh <<ZRAMEOF
 #!/bin/bash
-# Auto-generated by vpn-node-setup v5.3.0 (fix #13): zram-swap anti-OOM.
+# Auto-generated by vpn-node-setup v5.7.0 (fix #13 + zram writeback): zram-swap anti-OOM.
 set -e
 ZRAM_MB=${ZRAM_MB}
+# v5.7.0: writeback — выгрузка incompressible/idle ("холодных") страниц из
+# zram на выделенный block device, освобождая RAM. Задаётся оператором:
+#   ZRAM_WRITEBACK_DEV=/dev/sdXN sudo bash setup.sh --optimize
+# Пусто = writeback выключен (типичный VPS без свободного раздела).
+WB_DEV=${ZRAM_WRITEBACK_DEV:-}
 modprobe zram 2>/dev/null || true
-# Берём первое свободное zram-устройство (не ломаем чужие, напр. zram0 от systemd).
-DEV=\$(zramctl --find --size \${ZRAM_MB}M --algorithm zstd 2>/dev/null) || {
-    # Fallback для старых zramctl без --find
-    [ -e /dev/zram0 ] || echo 1 > /sys/class/zram-control/hot_add 2>/dev/null || true
-    DEV=/dev/zram0
-    echo zstd > /sys/block/zram0/comp_algorithm 2>/dev/null || true
-    echo \${ZRAM_MB}M > /sys/block/zram0/disksize 2>/dev/null || true
-}
+if [ -n "\$WB_DEV" ] && [ -b "\$WB_DEV" ]; then
+    # Ручной путь: backing_dev обязан быть записан ДО disksize — zramctl
+    # --find --size этого не умеет, поэтому настраиваем устройство вручную.
+    ZNUM=\$(cat /sys/class/zram-control/hot_add 2>/dev/null || echo 0)
+    DEV=/dev/zram\${ZNUM}
+    echo zstd > /sys/block/zram\${ZNUM}/comp_algorithm 2>/dev/null || true
+    echo "\$WB_DEV" > /sys/block/zram\${ZNUM}/backing_dev 2>/dev/null || true
+    echo \${ZRAM_MB}M > /sys/block/zram\${ZNUM}/disksize 2>/dev/null || true
+else
+    # Берём первое свободное zram-устройство (не ломаем чужие, напр. zram0 от systemd).
+    DEV=\$(zramctl --find --size \${ZRAM_MB}M --algorithm zstd 2>/dev/null) || {
+        # Fallback для старых zramctl без --find
+        [ -e /dev/zram0 ] || echo 1 > /sys/class/zram-control/hot_add 2>/dev/null || true
+        DEV=/dev/zram0
+        echo zstd > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+        echo \${ZRAM_MB}M > /sys/block/zram0/disksize 2>/dev/null || true
+    }
+fi
 mkswap "\$DEV" >/dev/null 2>&1 || true
 # priority 100 — zram выше любого диск-swap (быстрее).
 swapon -p 100 "\$DEV" 2>/dev/null || true
@@ -3135,9 +3532,25 @@ ZUNIT
                 sleep 1
                 if grep -q zram /proc/swaps 2>/dev/null; then
                     print_ok "zram-swap активен (${ZRAM_MB}MB, zstd, priority 100) — переживёт reboot"
+                    [ -n "${ZRAM_WRITEBACK_DEV:-}" ] && \
+                        print_info "writeback: ${ZRAM_WRITEBACK_DEV} (холодные страницы → диск, RAM свободнее)"
                 else
                     print_warn "vpn-zram.service запущен, но zram не виден в /proc/swaps — проверь: swapon --show"
                 fi
+                # v5.7.0: vm-тюнинг под zram (рекомендации kernel docs / Fedora / Pop!_OS).
+                # swappiness=180: zram быстрый — агрессивный swapout ВЫГОДЕН
+                #   (>100 поддерживается с kernel 5.8; на старых — молча пропустится).
+                # page-cluster=0: читаем из zram по одной странице (readahead бессмысленнен
+                #   для RAM-backed swap, только тратит CPU на сжатие лишнего).
+                # watermark_boost_factor=0: отключаем преждевременный reclaim при
+                #   фрагментации — на малой RAM это провоцирует лишний swap-шторм.
+                cat > /etc/sysctl.d/99-vpn-zram.conf <<'ZSYS_EOF'
+# vpn-node-setup v5.7.0: vm tuning под zram-backed swap
+vm.swappiness = 180
+vm.page-cluster = 0
+vm.watermark_boost_factor = 0
+ZSYS_EOF
+                sysctl -p /etc/sysctl.d/99-vpn-zram.conf >/dev/null 2>&1 || true
             else
                 print_warn "Не удалось enable vpn-zram.service — zram не настроен"
             fi
@@ -3521,6 +3934,40 @@ UDEV_RINGS
         fi
     fi
 
+    # === БУСТ 2.7: Adaptive Interrupt Coalescing (v5.5.0, stage2) ===
+    # Без coalescing каждый пакет = отдельное IRQ → на высоком PPS softirq
+    # съедает CPU. Adaptive coalescing динамически балансирует latency/pps:
+    # драйвер сам решает когда батчить прерывания (при малой нагрузке —
+    # IRQ на каждый пакет = минимальный latency; при флуде — батчинг).
+    # Это БЕЗОПАСНЕЕ статичного rx-usecs: статика добавляет постоянный
+    # джиттер даже на пустой ноде, adaptive — нет.
+    #
+    # Поддержка: mlx4/mlx5, ixgbe, i40e, bnxt, некоторые e1000e.
+    # НЕ поддерживается: virtio_net (KVM/QEMU VPS — ethtool -c вернёт
+    # "Operation not supported") — там просто пропускаем.
+    if command -v ethtool >/dev/null 2>&1 && ethtool -c "$IFACE" >/dev/null 2>&1; then
+        COAL_CHANGED=()
+        # Читаем текущее состояние
+        CUR_ADP_RX=$(ethtool -c "$IFACE" 2>/dev/null | awk '/^Adaptive RX:/{print $3}')
+        CUR_ADP_TX=$(ethtool -c "$IFACE" 2>/dev/null | awk -F'Adaptive TX: ' '/^Adaptive TX:/{print $2}')
+
+        if [ "$CUR_ADP_RX" != "on" ] && ethtool -C "$IFACE" adaptive-rx on 2>/dev/null; then
+            COAL_CHANGED+=("adaptive-rx")
+        fi
+        if [ "$CUR_ADP_TX" != "on" ] && ethtool -C "$IFACE" adaptive-tx on 2>/dev/null; then
+            COAL_CHANGED+=("adaptive-tx")
+        fi
+
+        if [ ${#COAL_CHANGED[@]} -gt 0 ]; then
+            print_ok "Adaptive coalescing: ${COAL_CHANGED[*]} enabled (IRQ batching под нагрузкой)"
+            NIC_BOOSTS_APPLIED+=("adaptive coalescing")
+        else
+            print_info "Adaptive coalescing уже включён или не поддерживается драйвером"
+        fi
+    else
+        print_info "ethtool -c не поддерживается ($IFACE, вероятно virtio_net) — coalescing пропущен"
+    fi
+
     # === БУСТ 3: GRO Flush Timeout + napi_defer_hard_irqs ===
     # v5.0.5: ВОЗВРАЩЕНО к kernel default (0/0).
     # Раньше: gro_flush=50µs, napi_defer=1 — батчинг прерываний для экономии CPU.
@@ -3723,6 +4170,9 @@ if command -v ethtool >/dev/null 2>&1; then
     ethtool -K "$IFACE" lro off 2>/dev/null || true
     # v5.1.0: UDP-GRO forwarding (Hysteria2 PPS boost)
     ethtool -K "$IFACE" rx-udp-gro-forwarding on 2>/dev/null || true
+    # v5.5.0: Adaptive coalescing (no-op на virtio_net)
+    ethtool -C "$IFACE" adaptive-rx on 2>/dev/null || true
+    ethtool -C "$IFACE" adaptive-tx on 2>/dev/null || true
 fi
 
 # v5.1.0: Multi-queue NIC (best-effort, no-op на virtio max=1)
@@ -4031,6 +4481,205 @@ UNIT_EOF
 fi
 
 # ==============================================================================
+# ШАГ 7.9: FLOWTABLE — software flow offloading (v5.4.0, stage1)
+# ==============================================================================
+#
+# Что это: nftables flowtable ускоряет форвардинг established-потоков.
+# Первый пакет соединения идёт через полный netfilter-путь (все hooks,
+# conntrack, фильтры) — как только соединение помечено `flow add @ft`,
+# последующие пакеты идут по короткому пути: ingress → напрямую в egress,
+# МИНУЯ цепочки filter/forward. Это снимает большую часть per-packet
+# накладных расходов на VPN-ноде с тысячами одновременных соединений.
+#
+# Требования: kernel >= 4.16 (flow offload API), nftables >= 1.0.1.
+# На XanMod 6.x — полная поддержка. Software offload работает на ЛЮБОМ
+# интерфейсе (virtio включительно). v5.7.0: дополнительно пробуем HARDWARE
+# offload (flags offload, kernel >= 5.16) — на поддерживаемых NIC (mlx5,
+# bnxt, i40e, ice) established-потоки оффлоадятся прямо в силикон NIC и
+# CPU их вообще не видит. Probe транзакцией: не поддерживается → software.
+#
+# БЕЗОПАСНОСТЬ и совместимость:
+#   - Offload применяется ТОЛЬКО к ct state established,related — новые
+#     соединения всегда проходят полный путь (shieldnode rate-limits,
+#     blocklists, MSS clamp — всё работает как раньше).
+#   - Таблица inet vpn_node_flowtable — отдельная, не пересекается с
+#     inet ddos_protect (shieldnode) и inet vpn_node_mss_clamp.
+#   - Приоритет filter+10 на forward: выполняется ПОСЛЕ фильтров shieldnode
+#     (priority -100/-150 на prerouting) и MSS clamp (-150 на forward) —
+#     offload включается только для уже разрешённых потоков.
+#   - Отключить: sudo systemctl stop vpn-flowtable && nft delete table inet vpn_node_flowtable
+#     или DISABLE_FLOWTABLE=1 при установке.
+
+print_header "ШАГ 7.9: FLOWTABLE (software flow offloading)"
+
+FLOWTABLE_STATUS="skipped"
+
+if [ "${DISABLE_FLOWTABLE:-0}" = "1" ]; then
+    print_info "DISABLE_FLOWTABLE=1 — flow offloading выключен оператором"
+    FLOWTABLE_STATUS="disabled by operator"
+elif ! command -v nft >/dev/null 2>&1; then
+    print_info "nft не найден — flowtable пропущен (MSS clamp тоже был пропущен)"
+    FLOWTABLE_STATUS="skipped (no nftables)"
+elif [ -z "$IFACE" ]; then
+    IFACE=$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')
+    if [ -z "$IFACE" ]; then
+        print_info "Интерфейс не определён — flowtable пропущен"
+        FLOWTABLE_STATUS="skipped (no iface)"
+    fi
+fi
+
+if [ "$FLOWTABLE_STATUS" = "skipped" ]; then
+    # Проверяем поддержку flowtable текущим ядром — пробная транзакция.
+    # На kernel < 4.16 или nft < 1.0.1 получим ошибку парсинга → fallback.
+    FLOW_SUPPORTED=0
+    if nft -f - 2>/dev/null <<NFT_FLOW_PROBE
+table inet vpn_flow_probe {
+    flowtable f {
+        hook ingress priority filter
+        devices = { lo }
+    }
+    chain forward {
+        type filter hook forward priority filter + 10; policy accept;
+        ct state established,related flow add @f
+    }
+}
+NFT_FLOW_PROBE
+    then
+        FLOW_SUPPORTED=1
+        nft delete table inet vpn_flow_probe 2>/dev/null
+    fi
+
+    if [ "$FLOW_SUPPORTED" = "0" ]; then
+        print_warn "Kernel/nftables не поддерживает flowtable (kernel $(uname -r), nft $(v5_nft_version 2>/dev/null || echo '?'))"
+        print_info "После ребута на XanMod 6.x запусти --optimize повторно — flowtable активируется"
+        FLOWTABLE_STATUS="unsupported (kernel/nft too old)"
+    else
+        # v5.7.0: HARDWARE flow offload — пробуем flags offload на реальном NIC.
+        # Поддержка: kernel >= 5.16 + NIC с flow offload в драйвере (mlx5_cx5,
+        # bnxt, i40e, частично ice). На virtio/e1000/обычных VPS — probe
+        # молча провалится, остаёмся на software offload.
+        HW_OFFLOAD=0
+        if [ "${DISABLE_HW_FLOW_OFFLOAD:-0}" != "1" ]; then
+            # mlx5 и др. требуют явный hw-tc-offload на интерфейсе.
+            if command -v ethtool >/dev/null 2>&1; then
+                ethtool -K "$IFACE" hw-tc-offload on 2>/dev/null || true
+            fi
+            if nft -f - 2>/dev/null <<NFT_HW_PROBE
+table inet vpn_hw_probe {
+    flowtable f {
+        hook ingress priority filter
+        devices = { $IFACE }
+        flags offload
+    }
+}
+NFT_HW_PROBE
+            then
+                HW_OFFLOAD=1
+                nft delete table inet vpn_hw_probe 2>/dev/null
+            fi
+            if [ "$HW_OFFLOAD" = "1" ]; then
+                print_ok "NIC поддерживает HARDWARE flow offload ($IFACE: $(ethtool -i "$IFACE" 2>/dev/null | awk '/^driver:/ {print $2}')) — оффлоад в силикон"
+            fi
+        fi
+        HW_FLAGS_LINE=""
+        [ "$HW_OFFLOAD" = "1" ] && HW_FLAGS_LINE="        flags offload"
+
+        # Генерируем конфиг с реальным интерфейсом.
+        # devices = { $IFACE } — offload только для трафика основного NIC.
+        # Для туннельных интерфейсов (wg0, tun0) НЕ добавляем — там offload
+        # бесполезен (трафик userspace-драйвера и так не проходит forward hook
+        # для самого туннеля; offload нужен на физическом egress).
+        mkdir -p /etc/nftables.d
+        cat > /etc/nftables.d/vpn-node-flowtable.conf <<NFT_FLOW_EOF
+#!/usr/sbin/nft -f
+# Generated by vpn-node-setup v5.7.0 — flow offloading (software + hw-probe).
+# Ускоряет форвардинг established-потоков: пакеты разрешённых соединений
+# идут ingress → egress напрямую, минуя filter/forward цепочки.
+# Новые соединения ВСЕГДА проходят полный путь (shieldnode/MSS clamp работают).
+# Строка "flags offload" появляется только если NIC прошёл hw-probe (v5.7.0).
+#
+# Отключить: sudo systemctl stop vpn-flowtable && sudo nft delete table inet vpn_node_flowtable
+# Статус:    sudo nft list flowtables inet vpn_node_flowtable
+
+table inet vpn_node_flowtable {}
+delete table inet vpn_node_flowtable
+table inet vpn_node_flowtable {
+    flowtable ft {
+        hook ingress priority filter
+        devices = { $IFACE }
+$HW_FLAGS_LINE
+    }
+    chain forward {
+        type filter hook forward priority filter + 10; policy accept;
+        # Offload только established/related — новые соединения идут полный путь.
+        # comment для grep'абельности в nft list ruleset.
+        ct state established,related flow add @ft comment "v5_flow_offload"
+    }
+}
+NFT_FLOW_EOF
+
+        # Live apply (atomic: add-if-missing → delete → add внутри одной транзакции)
+        NFT_FLOW_ERR=$(mktemp /tmp/v5-nft-flow.XXXXXX.err) || NFT_FLOW_ERR=/dev/null
+        if nft -f /etc/nftables.d/vpn-node-flowtable.conf 2>"$NFT_FLOW_ERR"; then
+            rm -f "$NFT_FLOW_ERR"
+            print_ok "Flowtable применён live (ingress offload на $IFACE)"
+
+            # Systemd unit для persistence после reboot.
+            # ВАЖНО: стартуем ПОСЛЕ shieldnode/mss-clamp не обязательно —
+            # таблица независимая, порядок применения не важен (hooks по
+            # priority разруливаются kernel'ом, а не порядком загрузки).
+            cat > /etc/systemd/system/vpn-flowtable.service <<'FLOW_UNIT_EOF'
+[Unit]
+Description=vpn-node-setup v5.7.0 — nftables flowtable (flow offloading)
+After=network-pre.target
+Wants=network-pre.target
+DefaultDependencies=no
+Before=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/vpn-node-flowtable.conf
+ExecStop=-/usr/sbin/nft delete table inet vpn_node_flowtable
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/vpn-node-flowtable.conf
+
+[Install]
+WantedBy=multi-user.target
+FLOW_UNIT_EOF
+            systemctl daemon-reload 2>/dev/null || true
+            if systemctl enable vpn-flowtable.service >/dev/null 2>&1; then
+                print_ok "Systemd unit vpn-flowtable.service enabled (persistent после reboot)"
+            else
+                print_warn "Не удалось enable vpn-flowtable.service — offload live, но не переживёт reboot"
+            fi
+
+            # Проверка что flowtable реально в kernel
+            if nft list flowtable inet vpn_node_flowtable ft >/dev/null 2>&1; then
+                if [ "$HW_OFFLOAD" = "1" ]; then
+                    FLOWTABLE_STATUS="active (HW offload, $IFACE)"
+                else
+                    FLOWTABLE_STATUS="active (sw offload, $IFACE)"
+                fi
+                print_ok "Проверка: flowtable 'ft' активен в kernel на устройстве $IFACE ($([ "$HW_OFFLOAD" = "1" ] && echo hardware || echo software) offload)"
+            else
+                FLOWTABLE_STATUS="config written, verify failed"
+                print_warn "Конфиг записан, но проверка nft list flowtable не прошла"
+            fi
+        else
+            print_error "nft отверг flowtable-конфиг:"
+            [ -s "$NFT_FLOW_ERR" ] && sed 's/^/    /' "$NFT_FLOW_ERR" | head -5
+            rm -f "$NFT_FLOW_ERR"
+            FLOWTABLE_STATUS="failed (nft apply error)"
+        fi
+    fi
+fi
+
+echo ""
+print_info "Flow offload: $FLOWTABLE_STATUS"
+print_info "  Эффект заметен на нодах с высоким PPS (500+ клиентов, торренты, 4K-стримы)"
+print_info "  Мониторинг: sudo nft list flowtable inet vpn_node_flowtable ft"
+
+# ==============================================================================
 # ШАГ 8: НАСТРОЙКА ЛИМИТОВ (ULIMIT)
 # ==============================================================================
 
@@ -4072,6 +4721,81 @@ systemctl daemon-reexec
 print_ok "Systemd перезагружен"
 
 # ==============================================================================
+# ШАГ 8.5: STACK CONTRACT (v5.5.0, stage2) — /etc/node-profile.d/stack.conf
+# ==============================================================================
+#
+# Единый контракт между vpn-node-setup и shieldnode. Раньше связь была неявной:
+# shieldnode гадал кто владеет MSS clamp, включён ли IPv6, какой интерфейс —
+# по косвенным признакам (nft-таблицам, sysctl). Это давало класс багов
+# "кто за что отвечает" (напр. двойной MSS clamp до v3.20.5/v5.0).
+#
+# Теперь: каждый скрипт пишет СВОЮ секцию [vpn-node-setup] / [shieldnode]
+# в /etc/node-profile.d/stack.conf (INI-подобный формат, парсится grep'ом —
+# без зависимостей). Читает другой скрипт при установке/upgrade.
+#
+# Поля vpn-node-setup секции:
+#   version        — версия скрипта который писал
+#   mss_clamp      — owner (vpn-node-setup) + статус
+#   ipv6           — disabled (наш дефолт) / enabled
+#   iface          — основной интерфейс на момент установки
+#   flowtable      — статус flow offloading
+#   kernel         — ядро (xanmod-lts / mainline / custom)
+#   bbr            — версия BBR (v1/v3/unknown)
+#   profile        — RAM-профиль (SURVIVAL/BALANCED/PERFORMANCE/ULTRA)
+
+print_header "ШАГ 8.5: STACK CONTRACT"
+
+STACK_PROFILE_DIR=/etc/node-profile.d
+STACK_CONF=$STACK_PROFILE_DIR/stack.conf
+mkdir -p "$STACK_PROFILE_DIR"
+chmod 755 "$STACK_PROFILE_DIR"
+
+# Определяем kernel type для контракта
+if uname -r | grep -qi xanmod; then
+    STACK_KERNEL="xanmod-lts"
+elif [ "${KERNEL_BRANCH:-}" = "LTS-fresh-install" ] || [ "${KERNEL_BRANCH:-}" = "LTS-installed-MAIN-still-present" ]; then
+    STACK_KERNEL="xanmod-lts (pending reboot)"
+else
+    STACK_KERNEL="mainline ($(uname -r | cut -d- -f1))"
+fi
+
+# IPv6 статус (скрипт всегда отключает через sysctl в ШАГ 5)
+if [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" = "1" ] || \
+   grep -q 'disable_ipv6 = 1' /etc/sysctl.d/99-disable-ipv6.conf 2>/dev/null; then
+    STACK_IPV6="disabled"
+else
+    STACK_IPV6="enabled (pending reboot)"
+fi
+
+# Пишем секцию атомарно: читаем существующий файл, удаляем нашу старую
+# секцию, дописываем новую. Секции других скриптов (shieldnode) не трогаем.
+STACK_TMP=$(mktemp) || STACK_TMP=""
+if [ -n "$STACK_TMP" ]; then
+    if [ -f "$STACK_CONF" ]; then
+        # Удаляем предыдущую секцию [vpn-node-setup] (от заголовка до следующего [ или EOF)
+        awk '/^\[vpn-node-setup\]/{skip=1; next} /^\[/{skip=0} !skip' "$STACK_CONF" > "$STACK_TMP" 2>/dev/null || true
+    fi
+    cat >> "$STACK_TMP" <<STACK_EOF
+[vpn-node-setup]
+version=$SCRIPT_VERSION
+updated=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+mss_clamp=owner,vpn-node-setup,${MSS_CLAMP_STATUS:-unknown}
+ipv6=$STACK_IPV6
+iface=${IFACE:-unknown}
+flowtable=${FLOWTABLE_STATUS:-skipped}
+kernel=$STACK_KERNEL
+bbr=${BBR_VERSION:-unknown}
+profile=${PROFILE_NAME:-unknown}
+STACK_EOF
+    chmod 0644 "$STACK_TMP"
+    mv "$STACK_TMP" "$STACK_CONF"
+    print_ok "Stack contract записан: $STACK_CONF (секция [vpn-node-setup])"
+    print_info "  shieldnode прочитает mss_clamp/ipv6/iface при следующем install/upgrade"
+else
+    print_warn "mktemp failed — stack.conf не записан (не критично)"
+fi
+
+# ==============================================================================
 # ШАГ 9: ИТОГОВЫЙ ОТЧЁТ
 # ==============================================================================
 
@@ -4106,7 +4830,9 @@ echo -e "  │ CPU Level              │ ${GREEN}x86-64-v${CPU_LEVEL}${NC}     
 echo -e "  │ Профиль памяти         │ ${PROFILE_COLOR}$PROFILE_NAME${NC}                │"
 echo -e "  │ RAM                    │ ${GREEN}${TOTAL_MEM_MB} MB${NC}                            │"
 echo -e "  │ Лимит nofile           │ ${GREEN}$LIMIT_COUNT${NC}                          │"
-echo -e "  │ TCP Congestion         │ ${GREEN}BBRv3${NC}                               │"
+echo -e "  │ TCP Congestion         │ ${GREEN}BBR ${BBR_VERSION:-?}${NC}                               │"
+echo -e "  │ BBR runtime            │ ${GREEN}${BBR_RUNTIME_STATUS:-?}${NC}                 │"
+echo -e "  │ Flow offload           │ ${GREEN}${FLOWTABLE_STATUS:-skipped}${NC}           │"
 echo -e "  │ Qdisc                  │ ${GREEN}${QDISC_MODE:-fq}${NC}                     │"
 echo -e "  │ RPS                    │ ${GREEN}${RPS_MODE:-disabled}${NC}                 │"
 echo -e "  │ NIC Boosts             │ ${GREEN}${NIC_BOOSTS_SUMMARY:-none}${NC}            │"

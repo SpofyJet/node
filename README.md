@@ -1,58 +1,65 @@
-# vpn-node-setup
+# node — оптимизация VPS под VPN-ноду (Xray / Remnawave)
 
-Оптимизатор VPN-нод под Xray / Remnawave. Ставит ядро **XanMod LTS с BBRv3**, прогоняет полный системный и сетевой тюнинг, вешает MSS clamp и умеет диагностировать узкие места. Цель — выжать максимум пропускной способности и стабильности из ноды-релея.
+**v5.10.0** · Debian 12/13 · Ubuntu 24.04+ (jammy/focal не поддерживаются)
 
----
+Один скрипт: ядро XanMod LTS + BBRv3, тюнинг сетевого стека по профилям RAM,
+flow offloading, очистка системы от фонового мусора.
 
 ## Быстрый старт
 
 ```bash
-curl -fL https://raw.githubusercontent.com/SpofyJet/node/main/vpn-node-setup.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/SpofyJet/node/main/vpn-node-setup.sh -o vpn-node-setup.sh
+sudo bash vpn-node-setup.sh --optimize
+sudo reboot   # для перехода на XanMod
 ```
 
-После установки ядра **нужна перезагрузка**.
-
-## Требования
-
-| | |
-|---|---|
-| ОС | Debian 12/13 (bookworm/trixie) · Ubuntu 24.04+ (noble/plucky/…) |
-| Права | root |
-| После установки | reboot (смена ядра) |
-
-> ⚠️ **Ubuntu 22.04 (jammy) и 20.04 (focal) не поддерживаются** — XanMod не публикует для них ядра (404 на `deb.xanmod.org`). Скрипт проверяет это и выходит рано с понятным сообщением.
-
-## Возможности
-
-- **Ядро XanMod LTS + BBRv3** — современный congestion control из коробки.
-- **Системный sysctl-тюнинг** — сетевой стек, буферы, conntrack (tier-aware: параметры подбираются под размер ноды).
-- **MSS clamp** через nftables — против PMTU-blackhole на туннелях.
-- **RPS / softirq-тюнинг** — раскладка обработки пакетов по ядрам с корректной cpumask при любом числе CPU.
-- **NIC offload** — настройка gro/gso/tso и сопутствующего.
-- **Диагностика** — анализатор узких мест с опциональным авто-применением правок.
-- **Self-update / откат** — обновление и возврат на предыдущий снапшот ядра/конфига.
-
-## Режимы запуска
+Обновление до свежей версии (скрипт сам скачает себя с GitHub):
 
 ```bash
-sudo bash vpn-node-setup.sh                # (по умолчанию) полная оптимизация
-sudo bash vpn-node-setup.sh --diagnose     # только диагностика
-sudo bash vpn-node-setup.sh --upgrade      # обновить себя до свежей версии
-sudo bash vpn-node-setup.sh --rollback     # откат ядра/конфига на предыдущий снапшот
+sudo bash vpn-node-setup.sh --upgrade
 ```
 
-Пресеты диагностики: `--diagnose-quick`, `--diagnose-apply`, `--diagnose-no-net`, `--diagnose-dry-run`. Всё после `--` уходит напрямую в диагностический модуль (например `--diagnose -- -q -a -v`).
+## Что делает
 
-## Параметры (env при установке)
+| Компонент | Эффект |
+|---|---|
+| **XanMod LTS + BBRv3** | пропускная способность и latency под нагрузкой |
+| **Sysctl TIER-профили** | параметры под объём RAM (1GB → 16GB+) |
+| **Flowtable (sw + hw offload)** | established-потоки минуя filter-цепочки; на mlx5/bnxt/i40e — оффлоад в силикон NIC |
+| **MSS clamp (nftables)** | нет фрагментации в туннелях |
+| **UDP buffers 32/64M** | Hysteria2/TUIC на длинных линках |
+| **zram (zstd, opt writeback)** | anti-OOM на 1–2GB нодах |
+| **IRQ affinity + adaptive coalescing** | меньше jitter под PPS |
+| **busy_poll (opt-in)** | −10–30µs latency |
+| **Background cleanup** | выключает 100% мусор: packagekit, bluetooth, cups, avahi, thermald, ModemManager, motd-news и др. |
+| **unattended-upgrades OFF** | никаких фоновых apt (CPU/IO в случайный момент) |
 
-| Переменная | Дефолт | Назначение |
+## Флаги
+
+```
+--optimize          прямая оптимизация (для CI/ansible)
+--check             проверить новую версию на GitHub
+--upgrade           скачать и запустить свежую версию (со snapshot'ом)
+--diff              diff установленной и upstream-версии
+--rollback          откат после неудачного --upgrade
+--diagnose[-quick]  диагностика ноды (node-diagnostic)
+--dry-run           показать план без установки ядра
+```
+
+## Переменные окружения (opt-in / opt-out)
+
+| Переменная | Дефолт | Что даёт |
 |---|---|---|
-| `SETUP_REQUIRE_SIG` | `0` | требовать проверку minisign-подписи скрипта |
-| `SETUP_MINISIGN_PUBKEY` | — | публичный ключ minisign для верификации |
-| `SETUP_SIG_FINGERPRINT` | — | ожидаемый fingerprint подписи |
-| `XANMOD_GPG_KEY_ID` | `86F7D09EE734E623` | GPG-ключ репозитория XanMod |
-| `OLD_QLEN` | `1000` | исходная txqueuelen (для отчёта/отката) |
+| `DISABLE_FLOWTABLE=1` | off | не включать flow offloading |
+| `DISABLE_HW_FLOW_OFFLOAD=1` | off | только software offload |
+| `ENABLE_BUSY_POLL=1` | off | −10–30µs latency ценой CPU spin |
+| `SETUP_NO_ZRAM=1` | off | не создавать zram-swap |
+| `ZRAM_WRITEBACK_DEV=/dev/sdXN` | off | выгрузка холодных страниц zram на диск |
+| `SETUP_DISABLE_BG_SERVICES=0` | on | не трогать фоновые сервисы |
+| `SETUP_DISABLE_UNATTENDED=0` | on | оставить авто-обновления apt |
+| `SETUP_DISABLE_SNAPD=1` | off | +40–70MB RAM (не на Ubuntu Pro) |
+| `SETUP_DISABLE_MTA=1` | off | выключить exim4/postfix |
+| `DISABLE_TFO=1` | off | выключить TCP Fast Open |
 
-## Версия
-
-**v5.3.5** · история изменений — в шапке `vpn-node-setup.sh` и в разделе Releases.
+Changelog — в шапке `vpn-node-setup.sh` (newest-first).
+Парный проект: [SpofyJet/shield](https://github.com/SpofyJet/shield) — защита ноды от сканеров/DDoS.
