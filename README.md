@@ -1,6 +1,6 @@
 # node — оптимизация VPS под VPN-ноду (Xray / Remnawave)
 
-**v5.10.0** · Debian 12/13 · Ubuntu 24.04+ (jammy/focal не поддерживаются)
+**v5.10.2** · Debian 12/13 · Ubuntu 24.04+ (jammy/focal не поддерживаются)
 
 Один скрипт: ядро XanMod LTS + BBRv3, тюнинг сетевого стека по профилям RAM,
 flow offloading, очистка системы от фонового мусора.

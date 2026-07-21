@@ -8,13 +8,31 @@
 #  ██╔╝ ██╗██║  ██║██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝
 #  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ 
 #                                                         
-#  XRAY/REMNAWAVE NODE BUILDER v5.10.0 (bg cleanup: only 100% garbage + real disable)
+#  XRAY/REMNAWAVE NODE BUILDER v5.10.2 (fix: BBR stale в stack.conf)
+#  FIX  stack.conf писал bbr=v1 снапшотом ДО ребута на XanMod → shieldnode
+#       потом показывал "BBR v1" на ноде, где давно XanMod = v3 (репорт).
+#       Теперь при pending-reboot пишется целевое "v3 (XanMod, pending reboot)",
+#       а shieldnode v3.37.2 дополнительно детектит BBR по живому ядру.
+#  FIX  self-review: backticks в unquoted heredoc'ах — `` `--` `` в --help и
+#       `` `bbr` `` в комментарии sysctl-файла выполнялись как КОМАНДЫ при
+#       генерации ("--: command not found" + потеря текста в файле).
+#       Заменены на обычные кавычки.
+#
+#  XRAY/REMNAWAVE NODE BUILDER v5.10.1 (fix: packagekit purge вместо mask)
 #  Ядро XanMod LTS + BBRv3 + Полная оптимизация системы + MSS clamp + Diagnostics
 #  Поддерживает: Debian 12/13 (bookworm/trixie), Ubuntu 24.04+ (noble/plucky/…)
 #  ВНИМАНИЕ: Ubuntu 22.04 (jammy) и 20.04 (focal) НЕ поддерживаются — XanMod не
 #  публикует для них ядра (404 на deb.xanmod.org). Скрипт это проверяет и выходит
 #  рано с понятным сообщением (см. guard в ШАГ 4).
 #
+#  ============================================================================
+#  v5.10.1:
+#  ============================================================================
+#  FIX  packagekit: "GDBus.Error: UnitMasked" при apt update (репорт). У пакета
+#       есть apt-hook, дёргающий packagekit через D-Bus на каждый apt update —
+#       после mask (v5.10.0) hook спотыкался. packagekit больше не маскируется,
+#       а УДАЛЯЕТСЯ purge (hook уходит с пакетом; unmask перед purge снимает
+#       маску v5.10.0 для возможной переустановки). Обратимо: apt install.
 #  ============================================================================
 #  v5.10.0 (bg cleanup — только 100% мусор + РЕАЛЬНОЕ отключение):
 #  ============================================================================
@@ -262,7 +280,7 @@ set -o pipefail
 # ==============================================================================
 
 # v5.0: версия + repo URL для self-upgrade
-SCRIPT_VERSION="5.10.0"
+SCRIPT_VERSION="5.10.2"
 SCRIPT_REPO_URL="${SCRIPT_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/node/main/vpn-node-setup.sh}"
 
 # v5.3.0 (fix #17): XanMod signing key ID вынесен в именованную константу.
@@ -737,7 +755,7 @@ OPTIONS:
   --diagnose-dry-run    Показать что было бы применено node-diagnostic'ом, не делать.
   --diagnose-verbose    Детальный режим (-v).
 
-                   Также поддерживается passthrough любых флагов через `--`:
+                   Также поддерживается passthrough любых флагов через '--':
                      bash setup.sh --diagnose -- -q -a
                      bash setup.sh --diagnose -- --no-net -v
 
@@ -1696,8 +1714,6 @@ if [ "${SETUP_DISABLE_BG_SERVICES:-1}" = "1" ]; then
     #   bare metal), tuned (ставят осознанно), sysstat (sar-мониторинг),
     #   e2scrub (online fsck на LVM).
     BG_SERVICES=(
-        # PackageKit — десктопный апдейтер (GNOME Software), на headless мусор.
-        "packagekit.service"
         # "Новости" в MOTD — рекламный fetch от Ubuntu. Мусор.
         "motd-news.timer"
         # AccountsService — учётки для десктопных сессий (GDM/GNOME). Headless мусор.
@@ -1733,6 +1749,25 @@ if [ "${SETUP_DISABLE_BG_SERVICES:-1}" = "1" ]; then
         esac
     done
     [ "$BG_DISABLED" -eq 0 ] && print_info "Фоновые сервисы из списка не найдены (чистый образ)"
+
+    # packagekit — ОСОБЫЙ случай (v5.10.1 FIX): disable/mask НЕЛЬЗЯ — у пакета
+    # есть apt-hook, который при КАЖДОМ apt update дёргает packagekit через
+    # D-Bus → "GDBus.Error: UnitMasked" (репорт из установки). На headless
+    # это 100% мусор (GNOME Software updater) — сносим целиком, hook уходит
+    # вместе с пакетом. Обратимо: apt install packagekit.
+    # Сначала unmask — снимаем маску, если v5.10.0 её поставил (маска в
+    # /etc/systemd/system мешала бы возможной переустановке).
+    if dpkg -l packagekit 2>/dev/null | grep -q '^ii' || \
+       [ -L /etc/systemd/system/packagekit.service ]; then
+        systemctl unmask packagekit.service >/dev/null 2>&1 || true
+        systemctl stop packagekit.service >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y packagekit packagekit-tools >/dev/null 2>&1 || true
+        if ! dpkg -l packagekit 2>/dev/null | grep -q '^ii'; then
+            print_ok "packagekit удалён (purge) — apt-hook больше не дёргает мёртвый юнит, +50-100MB RAM"
+        else
+            print_warn "packagekit не удалился — проверь: apt purge packagekit"
+        fi
+    fi
 
     # irqbalance — ОСОБЫЙ случай: он динамически перераспределяет IRQ affinity
     # и КОНФЛИКТУЕТ с нашей ручной привязкой IRQ (nic-tuning, smp_affinity_list):
@@ -3099,7 +3134,7 @@ cat >> $SYSCTL_FILE <<EOF
 # Generated: $(date -u +%Y-%m-%d)
 
 # === BBRv3 Congestion Control ===
-# v5.3.2: на XanMod `bbr` = BBRv3 (built-in, дефолт). default_qdisc=fq перебивает
+# v5.3.2: на XanMod 'bbr' = BBRv3 (built-in, дефолт). default_qdisc=fq перебивает
 # дефолт XanMod (fq_pie) — оба работают с BBRv3, но Google рекомендует именно fq.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -4767,6 +4802,15 @@ else
     STACK_IPV6="enabled (pending reboot)"
 fi
 
+# BBR для контракта (v5.10.2, FIX-BBR-STALE): если XanMod только что поставлен
+# и ребут впереди — BBR_VERSION содержит "v1" ТЕКУЩЕГО generic-ядра. Писать его
+# в контракт = протухший снапшот (shieldnode потом показывал "BBR v1" на ноде,
+# где уже давно XanMod = v3). Пишем целевое значение с пометкой pending.
+STACK_BBR="${BBR_VERSION:-unknown}"
+if echo "$STACK_KERNEL" | grep -q "pending reboot"; then
+    STACK_BBR="v3 (XanMod backport, pending reboot)"
+fi
+
 # Пишем секцию атомарно: читаем существующий файл, удаляем нашу старую
 # секцию, дописываем новую. Секции других скриптов (shieldnode) не трогаем.
 STACK_TMP=$(mktemp) || STACK_TMP=""
@@ -4784,7 +4828,7 @@ ipv6=$STACK_IPV6
 iface=${IFACE:-unknown}
 flowtable=${FLOWTABLE_STATUS:-skipped}
 kernel=$STACK_KERNEL
-bbr=${BBR_VERSION:-unknown}
+bbr=$STACK_BBR
 profile=${PROFILE_NAME:-unknown}
 STACK_EOF
     chmod 0644 "$STACK_TMP"
