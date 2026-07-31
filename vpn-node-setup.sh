@@ -8,7 +8,13 @@
 #  ██╔╝ ██╗██║  ██║██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝
 #  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ 
 #                                                         
-#  XRAY/REMNAWAVE NODE BUILDER v5.10.2 (fix: BBR stale в stack.conf)
+#  XRAY/REMNAWAVE NODE BUILDER v5.10.3 (fix: static-юниты воскресали после "отключения")
+#  FIX BUG-STATIC-REVIVE (репорт: ModemManager + unattended-upgrades живы после
+#       прогона): disable_unit_real для НЕАКТИВНОГО static юнита получал ошибку
+#       is-enabled (нет [Install]) → "уже мёртв" БЕЗ маски → dbus/timer поднимал
+#       его снова через часы. Теперь enabled-state читается текстом и
+#       static/indirect/dbus-activated маскируются ВСЕГДА.
+#  v5.10.2 (fix: BBR stale в stack.conf)
 #  FIX  stack.conf писал bbr=v1 снапшотом ДО ребута на XanMod → shieldnode
 #       потом показывал "BBR v1" на ноде, где давно XanMod = v3 (репорт).
 #       Теперь при pending-reboot пишется целевое "v3 (XanMod, pending reboot)",
@@ -280,7 +286,7 @@ set -o pipefail
 # ==============================================================================
 
 # v5.0: версия + repo URL для self-upgrade
-SCRIPT_VERSION="5.10.2"
+SCRIPT_VERSION="5.10.3"
 SCRIPT_REPO_URL="${SCRIPT_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/node/main/vpn-node-setup.sh}"
 
 # v5.3.0 (fix #17): XanMod signing key ID вынесен в именованную константу.
@@ -1618,22 +1624,36 @@ SERVICES_TO_DISABLE=(
 # Отключение было мнимым. Реальный путь: disable --now → проверить статус →
 # если выжил (static/dbus) → mask --now (это глушит и dbus-активацию).
 # Возврат: 0=отключили, 2=юнита нет в системе, 3=уже был мёртв, 1=не смогли.
+# v5.10.3 (BUG-STATIC-REVIVE): старая логика для НЕАКТИВНОГО static юнита
+# (ModemManager, unattended-upgrades, bluetooth...) получала ошибку от
+# is-enabled (нет [Install]) → return 3 "уже мёртв" БЕЗ маски. Спустя часы
+# dbus/timer поднимал юнит снова — "отключённое" воскресало само.
+# Теперь: enabled-state читаем текстом; static/indirect/dbus-activated —
+# маскируем ВСЕГДА (иначе их поднимут через dbus/timer активацию).
 disable_unit_real() {
-    local unit="$1"
+    local unit="$1" state=""
     systemctl list-unit-files "$unit" >/dev/null 2>&1 || return 2
-    if ! systemctl is-active "$unit" >/dev/null 2>&1 && \
-       ! systemctl is-enabled "$unit" >/dev/null 2>&1; then
+    state=$(systemctl is-enabled "$unit" 2>/dev/null)
+    # Уже masked и неактивен — точно мёртв
+    if [ "$state" = "masked" ] && ! systemctl is-active "$unit" >/dev/null 2>&1; then
         return 3
     fi
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
-    # Static/dbus-activated переживают disable — добиваем маской.
-    if systemctl is-active "$unit" >/dev/null 2>&1 || \
-       systemctl is-enabled "$unit" >/dev/null 2>&1; then
+    state=$(systemctl is-enabled "$unit" 2>/dev/null)
+    case "$state" in
+        # static/indirect/dbus-activated переживают disable — добиваем маской.
+        enabled|enabled-runtime|static|indirect|alias|linked|linked-runtime)
+            systemctl mask --now "$unit" >/dev/null 2>&1 || true ;;
+    esac
+    # Активен, но state не распознан (например 'disabled' но dbus поднял) —
+    # тоже маскируем, иначе воскреснет.
+    if systemctl is-active "$unit" >/dev/null 2>&1; then
         systemctl mask --now "$unit" >/dev/null 2>&1 || true
     fi
     # Финальная верификация по факту
     systemctl is-active "$unit" >/dev/null 2>&1 && return 1
-    systemctl is-enabled "$unit" >/dev/null 2>&1 && return 1
+    state=$(systemctl is-enabled "$unit" 2>/dev/null)
+    case "$state" in enabled|enabled-runtime) return 1 ;; esac
     return 0
 }
 
@@ -2797,6 +2817,22 @@ if [ -f /etc/gai.conf ]; then
 fi
 
 print_ok "IPv6 отключён через sysctl (модуль остаётся в памяти, но трафик не работает)"
+
+# v5.10.3: синхронизируем ufw — при выключенном IPv6 обязателен IPV6=no в
+# /etc/default/ufw, иначе ufw reload падает на ip6tables правилах
+# ("ERROR: problem running") и аудит фиксирует drift. Идемпотентно.
+if [ -f /etc/default/ufw ]; then
+    if ! grep -qE '^IPV6=no' /etc/default/ufw; then
+        sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
+        print_ok "ufw: IPV6=no (синхронизировано с выключенным IPv6)"
+        if command -v ufw >/dev/null 2>&1 && LANG=C LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw reload >/dev/null 2>&1 || true
+        fi
+    else
+        print_info "ufw: IPV6=no уже выставлен"
+    fi
+fi
+
 print_info "Если хочешь полностью выгрузить модуль — добавь ipv6.disable=1 в GRUB вручную:"
 print_info "  sed -i 's|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"ipv6.disable=1 |' /etc/default/grub"
 print_info "  update-grub  # затем reboot"
