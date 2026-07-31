@@ -8,6 +8,65 @@
 #  ██╔╝ ██╗██║  ██║██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝
 #  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ 
 #                                                         
+#  XRAY/REMNAWAVE NODE BUILDER v5.12.1 (compat pass: адаптация под окружения)
+#  ADD  ШАГ 7.10/7.11: mmcblk[0-9] (eMMC/SD на x86 SBC) добавлен во все
+#       device-паттерны scheduler/add_random (live + udev).
+#  ADD  noatime persistence без fstab: если / не описан в fstab (часть cloud
+#       образов), создаётся oneshot-юнит vpn-noatime-remount.service —
+#       remount при boot. Раньше такой системе noatime слетал после reboot.
+#  ADD  tmpfiles.d/udev rules пишутся только при наличии подсистемы
+#       (адаптивные сообщения вместо слепой записи).
+#  NOTE Конверт окружений (жёстко в ШАГ 1): x86_64 + KVM/Xen/Hyper-V/VMware/
+#       bare-metal + Debian 12/13 / Ubuntu 24.04+; LXC/OpenVZ/docker —
+#       блокируются рано. Все шаги 7.10/7.11 внутри конверта деградируют
+#       мягко: нет устройства/ФС/подсистемы → info, а не ошибка.
+#
+#  XRAY/REMNAWAVE NODE BUILDER v5.12.0 (SSD/NVMe: убираем HDD-эпохи артефакты)
+#  NEW  ШАГ 7.11A noatime: убирает запись access-time на КАЖДОЕ чтение файла
+#       (relatime — дефолт со времён HDD; на SSD лишние write-операции и
+#       journal-нагрузка ext4/xfs). Live remount + fstab edit с backup и
+#       findmnt --verify (при ошибке парсинга — автоматический restore).
+#       Kill-switch: SKIP_NOATIME=1.
+#  NEW  ШАГ 7.11B discard-strip + fstrim.timer: опция монтирования discard
+#       (sync TRIM на каждый delete — latency-спайки на SSD) убирается из
+#       fstab; вместо неё включается weekly fstrim.timer — рекомендованный
+#       современный режим TRIM. Kill-switch: SKIP_FSTRIM=1.
+#  FIX  7.10B: virtio-диски (vd*/xvd*) теперь переводятся в scheduler=none
+#       БЕЗ проверки rotational — virtio иногда сообщает rotational=1
+#       (misreport), а scheduling всё равно делает гипервизор.
+#  NEW  ШАГ 7.11C queue/add_random=0: на NVMe/SSD per-I/O entropy mixing
+#       добавляет cacheline-bounce на каждый запрос (дефолт со времён
+#       медленных дисков). Энтропия на VPS идёт через virtio-rng/RDRAND —
+#       отключение безопасно. Live + udev. Kill-switch: DISABLE_ADD_RANDOM=1.
+#  NEW  ШАГ 7.11D vm.dirty_background_ratio=5 / dirty_ratio=10: дефолт 20/10%
+#       от RAM на 16-32GB ноде = 3-6GB dirty pages → writeback-всплески
+#       стопорят fsync (crowdsec sqlite, journald). Меньшие лимиты = плавный
+#       фоновый сброс, SSD справляется. Kill-switch: DISABLE_DIRTY_TUNE=1.
+#  Master kill-switch всего шага: DISABLE_SSD_TUNE=1.
+#
+#  XRAY/REMNAWAVE NODE BUILDER v5.11.0 (self-review: THP + I/O sched + Docker logs)
+#  NEW  ШАГ 7.10A THP=madvise: Transparent HugePages в режим "по запросу".
+#       THP=always (дефолт многих образов) даёт latency-спайки сетевым демонам
+#       (compaction до 10-100ms под памятью) и bloat RSS у xray. madvise —
+#       hugepages только для приложений, явно просящих их (Redis и пр.).
+#       Live apply + boot persistence через /etc/tmpfiles.d/thp-madvise.conf.
+#       Kill-switch: DISABLE_THP_TUNE=1.
+#  NEW  ШАГ 7.10B I/O scheduler=none для vd/sd/xvd/nvme на VPS: гипервизор
+#       (KVM/virtio) уже делает scheduling на хосте — двойная очередь
+#       mq-deadline/bfq в госте только добавляет latency. none = прямой путь.
+#       Live apply + persistence через udev rule 60-vpn-io-scheduler.rules.
+#       Kill-switch: DISABLE_IO_SCHED_TUNE=1.
+#  NEW  ШАГ 7.10C Docker daemon.json: json-file logs max-size=10m max-file=3
+#       (защита диска от разросшихся логов контейнеров) + live-restore=true
+#       (контейнеры переживают restart dockerd при apt upgrade docker.io).
+#       Безопасный JSON-merge через python3, backup, без форс-рестарта dockerd
+#       (применится к новым контейнерам / после планового рестарта).
+#       Kill-switch: SKIP_DOCKER_TUNE=1.
+#  NOTE Саморевью пунктов 1-10 (2026-07): п.1,2,3,5,6,10 оказались дубликатами
+#       уже существующего (tcp_slow_start_after_idle/mtu_probing/fastopen/
+#       keepalive/conntrack 14400/nft log meters), п.4 (notsent_lowat) —
+#       регрессия (удалён v5.0.5). Реально новые: 7,8,9 — они и вошли.
+#
 #  XRAY/REMNAWAVE NODE BUILDER v5.10.3 (fix: static-юниты воскресали после "отключения")
 #  FIX BUG-STATIC-REVIVE (репорт: ModemManager + unattended-upgrades живы после
 #       прогона): disable_unit_real для НЕАКТИВНОГО static юнита получал ошибку
@@ -286,7 +345,7 @@ set -o pipefail
 # ==============================================================================
 
 # v5.0: версия + repo URL для self-upgrade
-SCRIPT_VERSION="5.10.3"
+SCRIPT_VERSION="5.12.1"
 SCRIPT_REPO_URL="${SCRIPT_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/node/main/vpn-node-setup.sh}"
 
 # v5.3.0 (fix #17): XanMod signing key ID вынесен в именованную константу.
@@ -4751,6 +4810,495 @@ print_info "  Эффект заметен на нодах с высоким PPS 
 print_info "  Мониторинг: sudo nft list flowtable inet vpn_node_flowtable ft"
 
 # ==============================================================================
+# ШАГ 7.10: THP + I/O SCHEDULER + DOCKER DAEMON (v5.11.0, self-review п.7/8/9)
+# ==============================================================================
+# Результат саморевью пунктов 1-10: 1,2,3,5,6,10 уже реализованы ранее,
+# 4 (notsent_lowat) — регрессия (удалён v5.0.5). Реально новые — 7,8,9 ниже.
+
+print_header "ШАГ 7.10: THP + I/O SCHEDULER + DOCKER"
+
+# --- 7.10A: THP=madvise ------------------------------------------------------
+# THP=always даёт сетевым демонам latency-спайки (direct compaction 10-100ms
+# под нагрузкой) и раздувает RSS у процессов с множеством мелких аллокаций
+# (xray: буферы соединений). madvise = hugepages только для процессов, явно
+# запросивших их через madvise(MADV_HUGEPAGE) — Redis и пр. Сетевые демоны
+# их не запрашивают → работают на 4K страницах без compaction-спайков.
+THP_STATUS="skipped"
+if [ "${DISABLE_THP_TUNE:-0}" != "1" ]; then
+    if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
+        THP_BEFORE=$(sed -n 's/.*\[\([a-z]*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)
+        # Live apply (идемпотентно)
+        echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+        # defrag=madvise: direct compaction только для madvise-регионов
+        [ -f /sys/kernel/mm/transparent_hugepage/defrag ] && \
+            echo madvise > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
+        # Boot persistence через tmpfiles.d (выполняется рано при загрузке).
+        # v5.12.1: пишем только если подсистема есть (экзотика без systemd).
+        if [ -d /etc/tmpfiles.d ]; then
+            cat > /etc/tmpfiles.d/thp-madvise.conf <<'THP_EOF'
+# vpn-node-setup v5.11.0: THP в режим madvise (anti-latency-спайки для xray).
+# w = write при boot. Не трогать — перезаписывается апгрейдом скрипта.
+w /sys/kernel/mm/transparent_hugepage/enabled - - - - madvise
+w /sys/kernel/mm/transparent_hugepage/defrag - - - - madvise
+THP_EOF
+        else
+            print_info "tmpfiles.d отсутствует — THP live-only до reboot"
+        fi
+        THP_AFTER=$(sed -n 's/.*\[\([a-z]*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)
+        # Fallback: если формат без скобок (экзотика) — проверяем слово madvise
+        if [ -z "$THP_AFTER" ] && grep -qw madvise /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null; then
+            THP_AFTER="madvise"
+        fi
+        if [ "$THP_AFTER" = "madvise" ]; then
+            THP_STATUS="madvise (было: ${THP_BEFORE:-?})"
+            print_ok "THP: ${THP_BEFORE:-?} → madvise (live + /etc/tmpfiles.d/thp-madvise.conf)"
+        else
+            THP_STATUS="apply failed (попытка: madvise)"
+            print_warn "Не удалось переключить THP в madvise (kernel ограничение?)"
+        fi
+    else
+        THP_STATUS="n/a (kernel без THP)"
+        print_info "THP: /sys/kernel/mm/transparent_hugepage отсутствует — пропуск"
+    fi
+else
+    print_info "THP tuning пропущен (DISABLE_THP_TUNE=1)"
+fi
+
+# --- 7.10B: I/O scheduler=none ----------------------------------------------
+# На VPS (virtio/KVM) гипервизор УЖЕ выполняет I/O scheduling на хосте.
+# Вторая очередь в госте (mq-deadline/bfq) только добавляет latency и CPU
+# overhead без выигрыша. none = прямой путь к virtio-драйверу.
+# Ограничение: только rotational==0 (SSD/virtio). Реальные HDD не трогаем —
+# им mq-deadline/bfq полезен для elevator-объединения запросов.
+IOSCHED_STATUS="skipped"
+if [ "${DISABLE_IO_SCHED_TUNE:-0}" != "1" ]; then
+    _IO_CHANGED=0
+    _IO_TOTAL=0
+    _IO_DEVS=""
+    for _bdev in /sys/block/vd[a-z] /sys/block/sd[a-z] /sys/block/xvd[a-z] /sys/block/nvme[0-9]n[0-9] /sys/block/mmcblk[0-9]; do
+        [ -e "$_bdev/queue/scheduler" ] || continue
+        # v5.12.0: virtio-диски (vd/xvd) — БЕЗ проверки rotational: virtio
+        # иногда misreport'ит rotational=1, а scheduling всё равно делает
+        # гипервизор. Для реальных sd/nvme/mmcblk HDD (rotational=1) пропускаем.
+        case "${_bdev##*/}" in
+            vd*|xvd*) : ;;
+            *) [ "$(cat "$_bdev/queue/rotational" 2>/dev/null)" = "1" ] && continue ;;
+        esac
+        # none должен быть доступен для этого устройства
+        grep -qw none "$_bdev/queue/scheduler" 2>/dev/null || continue
+        _IO_TOTAL=$((_IO_TOTAL + 1))
+        _IO_CUR=$(sed -n 's/.*\[\([a-z0-9-]*\)\].*/\1/p' "$_bdev/queue/scheduler" 2>/dev/null)
+        if [ "$_IO_CUR" != "none" ]; then
+            if echo none > "$_bdev/queue/scheduler" 2>/dev/null; then
+                _IO_CHANGED=$((_IO_CHANGED + 1))
+                _IO_DEVS="$_IO_DEVS ${_bdev##*/}(${_IO_CUR}→none)"
+            fi
+        fi
+    done
+    # Boot persistence через udev (правило срабатывает на add/change диска).
+    # Guard 'queue/rotational==0' + 'scheduler содержит none' — безопасно
+    # для HDD и устройств без none.
+    # v5.12.1: udev rules — только при наличии udev (все целевые дистрибутивы
+    # имеют его; guard для экзотики, live-настройка выше уже сработала).
+    if [ -d /etc/udev/rules.d ]; then
+    cat > /etc/udev/rules.d/60-vpn-io-scheduler.rules <<'UDEV_EOF'
+# vpn-node-setup v5.11.0/v5.12.1: I/O scheduler=none для SSD/virtio дисков VPS.
+# Гипервизор делает scheduling на хосте — гостевая очередь лишняя.
+# Правило 1: virtio (vd/xvd) — без проверки rotational (бывает misreport=1).
+# Правило 2: sd/nvme/mmcblk — только rotational==0 (реальные HDD не трогаем).
+# Требуем наличие none в списке scheduler'ов.
+ACTION=="add|change", KERNEL=="vd[a-z]|xvd[a-z]", \
+    ATTR{queue/scheduler}=="*none*", \
+    ATTR{queue/scheduler}="none"
+ACTION=="add|change", KERNEL=="sd[a-z]|nvme[0-9]n[0-9]|mmcblk[0-9]", \
+    ATTR{queue/rotational}=="0", ATTR{queue/scheduler}=="*none*", \
+    ATTR{queue/scheduler}="none"
+UDEV_EOF
+    else
+        print_info "udev отсутствует — I/O scheduler live-only (persistence не нужна на контейнерах)"
+    fi
+    if [ "$_IO_CHANGED" -gt 0 ]; then
+        IOSCHED_STATUS="none ($_IO_CHANGED dev:$_IO_DEVS)"
+        print_ok "I/O scheduler: переключено на none:$_IO_DEVS (+ udev rule 60-vpn-io-scheduler.rules)"
+    else
+        # Уже none везде или нет подходящих устройств
+        if [ "$_IO_TOTAL" -gt 0 ]; then
+            IOSCHED_STATUS="none (уже, $_IO_TOTAL dev)"
+            print_ok "I/O scheduler: уже none на $_IO_TOTAL SSD/virtio дисках (+ udev rule для persistence)"
+        else
+            IOSCHED_STATUS="n/a (нет подходящих vd/sd/xvd/nvme)"
+            print_info "I/O scheduler: подходящих блочных устройств не найдено"
+        fi
+    fi
+else
+    print_info "I/O scheduler tuning пропущен (DISABLE_IO_SCHED_TUNE=1)"
+fi
+
+# --- 7.10C: Docker daemon.json (log rotation + live-restore) ----------------
+# Проблема: xray/remnawave контейнеры пишут json-file logs без ротации —
+# access/error логи за месяцы = десятки GB на диске (репорт: диск забит
+# на ноде с активными клиентами). Ставим max-size=10m max-file=3 (30MB max
+# на контейнер) + live-restore=true (контейнеры переживают restart dockerd
+# при apt upgrade docker.io — не падает VPN на минуту обновления).
+# Безопасность: merge через python3 (чужие ключи daemon.json сохраняются),
+# backup, валидация JSON. dockerd НЕ рестартуем — log-opts применяются к
+# НОВЫМ контейнерам, live-restore — при следующем плановом рестарте dockerd.
+DOCKER_TUNE_STATUS="skipped"
+if [ "${SKIP_DOCKER_TUNE:-0}" != "1" ]; then
+    if command -v docker >/dev/null 2>&1 || [ -d /etc/docker ]; then
+        _DJ=/etc/docker/daemon.json
+        mkdir -p /etc/docker
+        if command -v python3 >/dev/null 2>&1; then
+            _DOCKER_RES=$(python3 - "$_DJ" <<'PYEOF'
+import json, os, shutil, sys, time
+
+path = sys.argv[1]
+cfg = {}
+existed = os.path.exists(path)
+if existed:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            print("ERR:daemon.json не JSON-объект — не трогаем")
+            sys.exit(1)
+    except Exception as e:
+        # Битый файл — бэкапим и начинаем заново
+        shutil.copy2(path, path + ".broken-" + time.strftime("%Y%m%d-%H%M%S"))
+        cfg = {}
+
+changes = []
+# live-restore: контейнеры переживают restart dockerd
+if cfg.get("live-restore") is not True:
+    cfg["live-restore"] = True
+    changes.append("live-restore=true")
+
+# log-opts только если драйвер json-file (дефолт) или не задан.
+# Чужой драйвер (journald/syslog/fluentd) — не ломаем.
+driver = cfg.get("log-driver", "json-file")
+if driver == "json-file":
+    opts = cfg.get("log-opts")
+    if not isinstance(opts, dict):
+        opts = {}
+        cfg["log-opts"] = opts
+    if opts.get("max-size") != "10m":
+        opts["max-size"] = "10m"
+        changes.append("log-opts.max-size=10m")
+    if opts.get("max-file") != "3":
+        opts["max-file"] = "3"
+        changes.append("log-opts.max-file=3")
+else:
+    changes.append("log-driver=" + driver + " (чужой, log-opts не трогали)")
+
+if not any(c.startswith(("live-restore", "log-opts")) for c in changes):
+    print("OK:unchanged")
+    sys.exit(0)
+
+if existed:
+    shutil.copy2(path, path + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+tmp = path + ".tmp-vpn"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+# Валидация записанного
+with open(tmp, "r", encoding="utf-8") as f:
+    json.load(f)
+os.replace(tmp, path)
+print("OK:changed:" + ",".join(changes))
+PYEOF
+)
+            case "$_DOCKER_RES" in
+                OK:changed:*)
+                    DOCKER_TUNE_STATUS="настроен (${_DOCKER_RES#OK:changed:})"
+                    print_ok "Docker daemon.json: ${_DOCKER_RES#OK:changed:} (backup: daemon.json.bak-*)"
+                    print_info "  log-opts применятся к НОВЫМ контейнерам; live-restore — после планового рестарта dockerd"
+                    print_info "  Для существующих контейнеров: cd <панель> && docker compose up -d --force-recreate (когда удобно)"
+                    ;;
+                OK:unchanged)
+                    DOCKER_TUNE_STATUS="уже настроен"
+                    print_ok "Docker daemon.json: уже содержит нужные опции (live-restore + log rotation)"
+                    ;;
+                ERR:*)
+                    DOCKER_TUNE_STATUS="skip (${_DOCKER_RES#ERR:})"
+                    print_warn "Docker: ${_DOCKER_RES#ERR:}"
+                    ;;
+                *)
+                    DOCKER_TUNE_STATUS="error (python3 merge failed)"
+                    print_warn "Docker daemon.json merge вернул неожиданный вывод — не трогаем"
+                    ;;
+            esac
+        else
+            # Нет python3: пишем fresh только если файла НЕТ (чужой не трогаем)
+            if [ ! -f "$_DJ" ]; then
+                cat > "$_DJ" <<'DOCKER_EOF'
+{
+  "live-restore": true,
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+DOCKER_EOF
+                DOCKER_TUNE_STATUS="создан fresh (no python3)"
+                print_ok "Docker daemon.json создан (live-restore + log rotation 10m×3)"
+                print_info "  Применится к новым контейнерам / после планового рестарта dockerd"
+            else
+                DOCKER_TUNE_STATUS="skip (есть daemon.json, нет python3 для merge)"
+                print_warn "Docker: daemon.json существует, python3 нет — merge пропущен (не ломаем чужой конфиг)"
+            fi
+        fi
+    else
+        print_info "Docker не установлен — daemon.json tuning пропущен"
+    fi
+else
+    print_info "Docker tuning пропущен (SKIP_DOCKER_TUNE=1)"
+fi
+
+# ==============================================================================
+# ШАГ 7.11: SSD/NVMe TUNING (v5.12.0 — убираем HDD-эпохи артефакты)
+# ==============================================================================
+
+print_header "ШАГ 7.11: SSD/NVMe TUNING"
+
+NOATIME_STATUS="skipped"; FSTRIM_STATUS="skipped"
+ADDRANDOM_STATUS="skipped"; DIRTY_STATUS="skipped"
+
+if [ "${DISABLE_SSD_TUNE:-0}" = "1" ]; then
+    print_info "ШАГ 7.11 пропущен (DISABLE_SSD_TUNE=1)"
+else
+
+# --- 7.11A+B: fstab — noatime + удаление discard (одна транзакция) ----------
+# atime: дефолтный relatime пишет access-time при чтении — на SSD это лишние
+# write-операции и journal-нагрузка ext4/xfs без пользы для VPN-ноды.
+# discard: sync TRIM на КАЖДЫЙ delete = latency-спайки; правильный режим —
+# weekly fstrim (ниже). Одна правка fstab: backup → awk → verify → apply.
+FSTAB=/etc/fstab
+_DO_NOATIME=0; _DO_DISCARD=0
+[ "${SKIP_NOATIME:-0}" != "1" ] && _DO_NOATIME=1
+[ "${SKIP_FSTRIM:-0}" != "1" ] && _DO_DISCARD=1
+
+if [ -f "$FSTAB" ] && [ $((_DO_NOATIME + _DO_DISCARD)) -gt 0 ]; then
+    _FSTAB_BAK="$FSTAB.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -a "$FSTAB" "$_FSTAB_BAK" 2>/dev/null || true
+    _FSTAB_TMP=$(mktemp) || _FSTAB_TMP=""
+    _FSTAB_CNT=$(mktemp) || _FSTAB_CNT=""
+    if [ -n "$_FSTAB_TMP" ] && [ -n "$_FSTAB_CNT" ]; then
+        awk -v do_noatime="$_DO_NOATIME" -v do_discard="$_DO_DISCARD" \
+            -v changed_file="$_FSTAB_CNT" '
+BEGIN { OFS="\t"; changed=0 }
+/^[[:space:]]*#/ || NF==0 { print; next }
+NF>=4 && $3 ~ /^(ext4|xfs|btrfs|f2fs)$/ {
+    n=split($4, opts, ",")
+    out=""; has_na=0; nch=0
+    for (i=1; i<=n; i++) {
+        o=opts[i]
+        if (do_discard==1 && o=="discard") { nch=1; continue }
+        if (o=="noatime" || o=="nodiratime") has_na=1
+        out = (out=="" ? o : out "," o)
+    }
+    if (do_noatime==1 && has_na==0) {
+        m=split(out, o2, ","); out2=""
+        for (i=1; i<=m; i++) {
+            if (o2[i]=="relatime" || o2[i]=="atime") continue
+            out2 = (out2=="" ? o2[i] : out2 "," o2[i])
+        }
+        out = (out2=="" ? "noatime" : out2 ",noatime")
+        nch=1
+    }
+    if (nch) changed++
+    $4=out
+    print; next
+}
+{ print }
+END { print changed+0 > changed_file }
+' "$FSTAB" > "$_FSTAB_TMP"
+
+        _FSTAB_CHANGES=$(cat "$_FSTAB_CNT" 2>/dev/null)
+        _FSTAB_OK=0
+        if [ "${_FSTAB_CHANGES:-0}" -gt 0 ] 2>/dev/null; then
+            # Валидация нового fstab ДО установки. findmnt --verify exit-code
+            # ненадёжен (0 даже с reachability-errors) — проверяем именно
+            # строку "0 parse errors": синтаксис fstab гарантированно цел.
+            if findmnt --verify --tab-file "$_FSTAB_TMP" 2>&1 | grep -q "0 parse errors"; then
+                _FSTAB_OK=1
+            elif mount -a --fake --fstab "$_FSTAB_TMP" >/dev/null 2>&1; then
+                _FSTAB_OK=1
+            else
+                print_warn "Новый fstab не прошёл валидацию — оставляем старый (backup: $_FSTAB_BAK)"
+            fi
+            if [ "$_FSTAB_OK" = "1" ]; then
+                cat "$_FSTAB_TMP" > "$FSTAB"
+                print_ok "fstab: изменено ${_FSTAB_CHANGES} записей (noatime +/− discard; backup: $_FSTAB_BAK)"
+            fi
+        fi
+        rm -f "$_FSTAB_TMP" "$_FSTAB_CNT"
+        [ "${_FSTAB_CHANGES:-0}" = "0" ] 2>/dev/null && rm -f "$_FSTAB_BAK" 2>/dev/null
+    fi
+else
+    [ ! -f "$FSTAB" ] && print_info "fstab отсутствует (контейнер?) — пропуск A/B"
+fi
+
+# Live remount noatime для уже смонтированных FS (без ребута)
+if [ "$_DO_NOATIME" = "1" ] && command -v findmnt >/dev/null 2>&1; then
+    _REMOUNTED=""; _RM_FAIL=""
+    while IFS= read -r _mp; do
+        [ -n "$_mp" ] || continue
+        _opts=$(findmnt -n -o OPTIONS "$_mp" 2>/dev/null) || continue
+        case ",$_opts," in
+            *,noatime,*) : ;;  # уже noatime
+            *)
+                if mount -o remount,noatime "$_mp" 2>/dev/null; then
+                    _REMOUNTED="$_REMOUNTED $_mp"
+                else
+                    _RM_FAIL="$_RM_FAIL $_mp"
+                fi ;;
+        esac
+    done <<< "$(findmnt -rn -o TARGET -t ext4,xfs,btrfs,f2fs 2>/dev/null)"
+    if [ -n "$_REMOUNTED" ]; then
+        NOATIME_STATUS="active ($_REMOUNTED)"
+        print_ok "noatime live remount:$_REMOUNTED"
+    elif [ -n "$_RM_FAIL" ]; then
+        NOATIME_STATUS="fstab only (remount failed:$_RM_FAIL)"
+        print_info "noatime: live remount не прошёл ($_RM_FAIL) — применится после reboot"
+    else
+        NOATIME_STATUS="active (уже)"
+        print_ok "noatime: уже активен на всех локальных FS"
+    fi
+else
+    [ "$_DO_NOATIME" = "0" ] && print_info "noatime пропущен (SKIP_NOATIME=1)"
+fi
+
+# v5.12.1: persistence-fallback для систем, где / НЕ описан в fstab
+# (часть cloud-образов монтирует root через kernel cmdline). Без этого
+# noatime слетел бы после reboot. Создаём oneshot-юнит с remount.
+if [ "$_DO_NOATIME" = "1" ] && [ -d /run/systemd/system ]; then
+    _ROOT_OPTS_NOW=$(findmnt -n -o OPTIONS / 2>/dev/null)
+    case ",$_ROOT_OPTS_NOW," in
+        *,noatime,*)
+            if ! grep -qE '^[[:space:]]*[^#][^[:space:]]*[[:space:]]+/[[:space:]]' /etc/fstab 2>/dev/null; then
+                if [ ! -f /etc/systemd/system/vpn-noatime-remount.service ]; then
+                    cat > /etc/systemd/system/vpn-noatime-remount.service <<'NA_UNIT_EOF'
+[Unit]
+Description=vpn-node-setup v5.12.1 — noatime remount / (root не описан в fstab)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mount -o remount,noatime /
+
+[Install]
+WantedBy=multi-user.target
+NA_UNIT_EOF
+                    systemctl daemon-reload 2>/dev/null || true
+                    if systemctl enable vpn-noatime-remount.service >/dev/null 2>&1; then
+                        print_ok "noatime persistence: vpn-noatime-remount.service (root не в fstab — fallback unit)"
+                    else
+                        print_warn "noatime live, но persistence не настроен (enable unit failed)"
+                    fi
+                fi
+            fi ;;
+    esac
+fi
+
+# fstrim.timer — weekly TRIM (правильная замена discard на SSD)
+if [ "${SKIP_FSTRIM:-0}" != "1" ]; then
+    if systemctl list-unit-files fstrim.timer >/dev/null 2>&1; then
+        systemctl unmask fstrim.timer >/dev/null 2>&1 || true
+        if systemctl enable --now fstrim.timer >/dev/null 2>&1; then
+            FSTRIM_STATUS="fstrim.timer active (weekly TRIM)"
+            print_ok "fstrim.timer: enabled (weekly TRIM — замена discard)"
+        else
+            FSTRIM_STATUS="enable failed"
+            print_warn "fstrim.timer не удалось включить"
+        fi
+    else
+        FSTRIM_STATUS="n/a (нет fstrim.timer)"
+        print_info "fstrim.timer отсутствует в системе — пропуск"
+    fi
+else
+    print_info "fstrim пропущен (SKIP_FSTRIM=1)"
+fi
+
+# --- 7.11C: queue/add_random=0 -----------------------------------------------
+# Per-I/O entropy mixing в block layer — наследие эпохи HDD (считалось что
+# seek-timings дают энтропию). На NVMe/SSD каждый I/O платит cacheline-bounce
+# за обновление entropy pool. Энтропия на VPS идёт через virtio-rng/RDRAND/
+# jitterentropy — отключение не влияет на качество /dev/random.
+if [ "${DISABLE_ADD_RANDOM:-0}" != "1" ]; then
+    _AR_CHANGED=0; _AR_TOTAL=0
+    for _bdev in /sys/block/vd[a-z] /sys/block/sd[a-z] /sys/block/xvd[a-z] /sys/block/nvme[0-9]n[0-9] /sys/block/mmcblk[0-9]; do
+        [ -e "$_bdev/queue/add_random" ] || continue
+        case "${_bdev##*/}" in
+            vd*|xvd*) : ;;
+            *) [ "$(cat "$_bdev/queue/rotational" 2>/dev/null)" = "1" ] && continue ;;
+        esac
+        _AR_TOTAL=$((_AR_TOTAL + 1))
+        if [ "$(cat "$_bdev/queue/add_random" 2>/dev/null)" != "0" ]; then
+            echo 0 > "$_bdev/queue/add_random" 2>/dev/null && _AR_CHANGED=$((_AR_CHANGED + 1))
+        fi
+    done
+    if [ -d /etc/udev/rules.d ]; then
+    cat > /etc/udev/rules.d/61-vpn-add-random.rules <<'AR_EOF'
+# vpn-node-setup v5.12.0/v5.12.1: add_random=0 — NVMe/SSD не участвуют в
+# entropy pool (per-I/O cacheline-bounce). Энтропия приходит через virtio-rng/
+# RDRAND.
+ACTION=="add|change", KERNEL=="vd[a-z]|xvd[a-z]", ATTR{queue/add_random}="0"
+ACTION=="add|change", KERNEL=="sd[a-z]|nvme[0-9]n[0-9]|mmcblk[0-9]", \
+    ATTR{queue/rotational}=="0", ATTR{queue/add_random}="0"
+AR_EOF
+    fi
+    if [ "$_AR_CHANGED" -gt 0 ]; then
+        ADDRANDOM_STATUS="0 ($_AR_CHANGED dev переключено)"
+        print_ok "add_random=0 на $_AR_CHANGED дисках (+ udev rule 61-vpn-add-random.rules)"
+    elif [ "$_AR_TOTAL" -gt 0 ]; then
+        ADDRANDOM_STATUS="0 (уже, $_AR_TOTAL dev)"
+        print_ok "add_random=0 уже на $_AR_TOTAL дисках (+ udev rule для persistence)"
+    else
+        ADDRANDOM_STATUS="n/a"
+        print_info "add_random: подходящих дисков не найдено"
+    fi
+else
+    print_info "add_random tuning пропущен (DISABLE_ADD_RANDOM=1)"
+fi
+
+# --- 7.11D: vm.dirty ratios — плавный writeback вместо всплесков -------------
+# Дефолт dirty_ratio=20% RAM: на 32GB ноде это 6.4GB dirty pages → редкие но
+# огромные writeback-всплески, стопорящие fsync (crowdsec sqlite, journald).
+# Меньшие лимиты = фоновый сброс маленькими порциями; SSD/NVMe справляется.
+# TIER-логика: ≤2GB RAM — ratio 5/10 (на 1GB это 50/100MB, безопасно);
+# >2GB — bytes 64M/256M (cap не зависит от роста RAM).
+if [ "${DISABLE_DIRTY_TUNE:-0}" != "1" ]; then
+    if [ "${TOTAL_MEM_MB:-0}" -gt 2048 ] 2>/dev/null; then
+        cat > /etc/sysctl.d/96-ssd-io-tuning.conf <<'DIRTY_EOF'
+# vpn-node-setup v5.12.0: плавный writeback (anti-burst) для SSD/NVMe.
+# bytes-лимиты: background flush с 64MB, hard-stall на 256MB — независимо
+# от объёма RAM. На NVMe 256MB flush занимает <1s.
+vm.dirty_background_bytes = 67108864
+vm.dirty_bytes = 268435456
+DIRTY_EOF
+        sysctl -w vm.dirty_background_bytes=67108864 >/dev/null 2>&1 || true
+        sysctl -w vm.dirty_bytes=268435456 >/dev/null 2>&1 || true
+        DIRTY_STATUS="bytes 64M/256M (>2GB RAM)"
+    else
+        cat > /etc/sysctl.d/96-ssd-io-tuning.conf <<'DIRTY_EOF'
+# vpn-node-setup v5.12.0: плавный writeback (anti-burst) для SSD/NVMe.
+# ratio-лимиты для малых нод (<=2GB RAM): 5%/10% от RAM.
+vm.dirty_background_ratio = 5
+vm.dirty_ratio = 10
+DIRTY_EOF
+        sysctl -w vm.dirty_background_ratio=5 >/dev/null 2>&1 || true
+        sysctl -w vm.dirty_ratio=10 >/dev/null 2>&1 || true
+        DIRTY_STATUS="ratio 5/10 (≤2GB RAM)"
+    fi
+    print_ok "dirty writeback limits: $DIRTY_STATUS (+ /etc/sysctl.d/96-ssd-io-tuning.conf)"
+else
+    print_info "dirty tuning пропущен (DISABLE_DIRTY_TUNE=1)"
+fi
+
+fi # DISABLE_SSD_TUNE
+
+# ==============================================================================
 # ШАГ 8: НАСТРОЙКА ЛИМИТОВ (ULIMIT)
 # ==============================================================================
 
@@ -4866,6 +5414,13 @@ flowtable=${FLOWTABLE_STATUS:-skipped}
 kernel=$STACK_KERNEL
 bbr=$STACK_BBR
 profile=${PROFILE_NAME:-unknown}
+thp=${THP_STATUS:-skipped}
+io_sched=${IOSCHED_STATUS:-skipped}
+docker_daemon=${DOCKER_TUNE_STATUS:-skipped}
+noatime=${NOATIME_STATUS:-skipped}
+fstrim=${FSTRIM_STATUS:-skipped}
+add_random=${ADDRANDOM_STATUS:-skipped}
+dirty_writeback=${DIRTY_STATUS:-skipped}
 STACK_EOF
     chmod 0644 "$STACK_TMP"
     mv "$STACK_TMP" "$STACK_CONF"
@@ -4918,6 +5473,13 @@ echo -e "  │ RPS                    │ ${GREEN}${RPS_MODE:-disabled}${NC}    
 echo -e "  │ NIC Boosts             │ ${GREEN}${NIC_BOOSTS_SUMMARY:-none}${NC}            │"
 echo -e "  │ IRQ Affinity           │ ${GREEN}${IRQ_AFFINITY_MODE:-skipped}${NC}         │"
 echo -e "  │ MSS clamp              │ ${GREEN}${MSS_CLAMP_STATUS:-skipped}${NC}      │"
+echo -e "  │ THP                    │ ${GREEN}${THP_STATUS:-skipped}${NC}                     │"
+echo -e "  │ I/O scheduler          │ ${GREEN}${IOSCHED_STATUS:-skipped}${NC}              │"
+echo -e "  │ Docker daemon          │ ${GREEN}${DOCKER_TUNE_STATUS:-skipped}${NC}        │"
+echo -e "  │ noatime                │ ${GREEN}${NOATIME_STATUS:-skipped}${NC}            │"
+echo -e "  │ TRIM (fstrim)          │ ${GREEN}${FSTRIM_STATUS:-skipped}${NC}             │"
+echo -e "  │ add_random             │ ${GREEN}${ADDRANDOM_STATUS:-skipped}${NC}          │"
+echo -e "  │ dirty writeback        │ ${GREEN}${DIRTY_STATUS:-skipped}${NC}              │"
 echo -e "  │ Conntrack max          │ ${GREEN}${CONNTRACK_MAX:-?} (${CONNTRACK_TIER:-?})${NC}      │"
 echo -e "  │ IPv6                   │ ${GREEN}отключён через sysctl${NC}              │"
 echo -e "  └─────────────────────────────────────────────────────────────────┘"
