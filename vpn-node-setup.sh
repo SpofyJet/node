@@ -8,6 +8,25 @@
 #  ██╔╝ ██╗██║  ██║██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝
 #  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ 
 #                                                         
+#  XRAY/REMNAWAVE NODE BUILDER v5.13.0 (datapath pack 2.0 — боевые находки node-perf)
+#  NEW  ШАГ 7.12A netdev_budget=600 / budget_usecs=8000 + tcp_max_tw_buckets=524288
+#       + tcp_mem по RAM (/etc/sysctl.d/96-vpn-datapath2.conf): дефолтный NAPI
+#       budget=300 захлёбывается при 20k+ сессий (softirq не успевает выгребать
+#       RX-ring); TIME_WAIT-потолок 16-32k — узкое место массовых подключений.
+#  NEW  ШАГ 7.12B fq limit=100000 flow_limit=1000 buckets=16384 (single-queue):
+#       дефолтные buckets=1024 → хеш-коллизии при >1000 потоков (head-of-line).
+#       Live + persistence vpn-fq-tune.service (network-pre). Только root=fq и
+#       одна очередь; mq-конфиги не трогаем.
+#  NEW  ШАГ 7.12C vGPU blacklist (qxl/bochs_drm/cirrus): headless VM грузит
+#       драйверы виртуальной видеокарты → "[TTM] Buffer eviction failed"
+#       ×тысячи/24ч + mutex-столл systemd. ВАЖНО: live-unload (modprobe -r)
+#       НЕ выполняется — на virtio-vgpu он уходит в D-state (TTM eviction),
+#       Ctrl+C бессилен (боевой инцидент 2026-08). Модули умрут после reboot.
+#       Kill-switch: SKIP_VGPU_BLACKLIST=1.
+#  NOTE ШАГ 7.12D (GOMEMLIMIT) — убран по решению владельца флота (2026-08):
+#       на нодах с zram (ШАГ 7.4) GC-паузы Go не наблюдаются на практике.
+#       Мастер kill-switch: DISABLE_DATAPATH2=1.
+#
 #  XRAY/REMNAWAVE NODE BUILDER v5.12.1 (compat pass: адаптация под окружения)
 #  ADD  ШАГ 7.10/7.11: mmcblk[0-9] (eMMC/SD на x86 SBC) добавлен во все
 #       device-паттерны scheduler/add_random (live + udev).
@@ -345,7 +364,7 @@ set -o pipefail
 # ==============================================================================
 
 # v5.0: версия + repo URL для self-upgrade
-SCRIPT_VERSION="5.12.1"
+SCRIPT_VERSION="5.13.0"
 SCRIPT_REPO_URL="${SCRIPT_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/node/main/vpn-node-setup.sh}"
 
 # v5.3.0 (fix #17): XanMod signing key ID вынесен в именованную константу.
@@ -5297,6 +5316,88 @@ else
 fi
 
 fi # DISABLE_SSD_TUNE
+
+# ==============================================================================
+# ШАГ 7.12: DATAPATH PACK 2.0 (боевые находки node-perf, 2026-08)
+# ==============================================================================
+
+print_header "ШАГ 7.12: DATAPATH PACK 2.0 (budget / tw_buckets / fq / vGPU)"
+
+if [ "${DISABLE_DATAPATH2:-0}" = "1" ]; then
+    print_info "ШАГ 7.12 пропущен (DISABLE_DATAPATH2=1)"
+else
+
+# --- 7.12A: sysctl datapath-ядро ---
+print_status "Применяем datapath sysctl (netdev_budget / tw_buckets / tcp_mem)..."
+DP_MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 1048576)
+DP_MEMP=$((DP_MEM_KB / 16))          # ≈ RAM_pages/4 — потолок tcp_mem
+[ "$DP_MEMP" -lt 65536 ] && DP_MEMP=65536
+cat > /etc/sysctl.d/96-vpn-datapath2.conf <<DP2_EOF
+# node-perf datapath pack 2.0 (v5.13.0)
+net.core.netdev_budget = 600          # B2: NAPI выгребает до 600 пакетов/цикл (деф 300)
+net.core.netdev_budget_usecs = 8000   # B2: до 8ms на poll-цикл (деф 2ms)
+net.ipv4.tcp_max_tw_buckets = 524288  # TIME_WAIT-потолок (деф 16-32k — мало для 20k сессий)
+net.ipv4.tcp_mem = $((DP_MEMP*3/4)) $((DP_MEMP*7/8)) $DP_MEMP   # pressure-пороги по RAM
+DP2_EOF
+sysctl -p /etc/sysctl.d/96-vpn-datapath2.conf >/dev/null 2>&1     && print_ok "datapath sysctl: budget=600/8000us, tw_buckets=524288, tcp_mem=${DP_MEMP}pg"     || print_warn "datapath sysctl: часть ключей не применилась live (вступит после reboot)"
+
+# --- 7.12B: fq параметры (только single-queue root=fq) ---
+if command -v tc >/dev/null 2>&1 && [ -n "${IFACE:-}" ]; then
+    DP_QN=$(ls -d /sys/class/net/"$IFACE"/queues/tx-* 2>/dev/null | wc -l)
+    DP_ROOT=$(tc qdisc show dev "$IFACE" 2>/dev/null | awk '/qdisc/ && /root/ {print $2; exit}')
+    if [ "${DP_QN:-1}" -le 1 ] && [ "$DP_ROOT" = "fq" ]; then
+        if tc qdisc replace dev "$IFACE" root fq limit 100000 flow_limit 1000 buckets 16384 2>/dev/null; then
+            print_ok "fq tuned: limit=100000 flow_limit=1000 buckets=16384"
+            DP_TC_BIN=$(command -v tc)
+            cat > /etc/systemd/system/vpn-fq-tune.service <<FQEOF
+[Unit]
+Description=VPN fq datapath tuning ($IFACE)
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+# guard: если появился mq (multi-queue) — НЕ перетираем его одиночным fq
+ExecStart=/bin/sh -c "$DP_TC_BIN qdisc show dev $IFACE | grep -q 'qdisc mq' || $DP_TC_BIN qdisc replace dev $IFACE root fq limit 100000 flow_limit 1000 buckets 16384"
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+FQEOF
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl enable vpn-fq-tune.service >/dev/null 2>&1                 && print_ok "vpn-fq-tune.service: persistence включён"                 || print_warn "vpn-fq-tune.service: enable не удался — fq параметры слетят после reboot"
+        else
+            print_warn "fq replace не удался — параметры не применены"
+        fi
+    elif [ "$DP_ROOT" = "mq" ]; then
+        print_info "fq tune: multi-queue (mq+fq per-queue) — глобальные параметры не трогаем"
+    else
+        print_info "fq tune: root qdisc = ${DP_ROOT:-unknown} (не fq) — пропуск"
+    fi
+else
+    print_info "fq tune: tc или IFACE недоступны — пропуск"
+fi
+
+# --- 7.12C: vGPU blacklist (БЕЗ live-unload — урок D-state/TTM) ---
+if [ "${SKIP_VGPU_BLACKLIST:-0}" != "1" ]; then
+    DP_VG=0
+    for m in qxl bochs_drm cirrus; do
+        if lsmod 2>/dev/null | grep -q "^$m" || [ -d /sys/module/$m ]; then
+            grep -qs "blacklist $m" /etc/modprobe.d/blacklist-vgpu.conf 2>/dev/null || {
+                mkdir -p /etc/modprobe.d; echo "blacklist $m" >> /etc/modprobe.d/blacklist-vgpu.conf; DP_VG=1; }
+        fi
+    done
+    if [ "$DP_VG" = "1" ]; then
+        print_ok "vGPU модули → /etc/modprobe.d/blacklist-vgpu.conf (выгрузятся после reboot)"
+        print_info "live-unload НЕ выполняем: modprobe -r на virtio-vgpu уходит в D-state (TTM eviction)"
+    elif [ -f /etc/modprobe.d/blacklist-vgpu.conf ]; then
+        print_info "vGPU blacklist уже на месте"
+    else
+        print_info "vGPU модули (qxl/bochs_drm/cirrus) не загружены — ок"
+    fi
+fi
+
+fi # DISABLE_DATAPATH2
 
 # ==============================================================================
 # ШАГ 8: НАСТРОЙКА ЛИМИТОВ (ULIMIT)
